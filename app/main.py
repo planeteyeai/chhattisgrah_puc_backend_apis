@@ -2,11 +2,12 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
 from app.api_response_storage import ensure_response_schema
 from app.biomass import router as biomass_router
@@ -83,6 +84,15 @@ app.include_router(classwise_router)
 app.include_router(biomass_router)
 app.middleware("http")(prometheus_middleware)
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+
+
+@app.exception_handler(OperationalError)
+async def database_unavailable(request: Request, exc: OperationalError) -> JSONResponse:
+    logger.error("database unavailable on %s: %s", request.url.path, exc.orig)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Database unavailable", "error": str(exc.orig).strip()},
+    )
 
 
 @app.get("/", include_in_schema=False)

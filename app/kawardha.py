@@ -8,7 +8,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.database import KawardhaSessionLocal, kawardha_engine
+from app.database import engine, get_db
 from app.geojson import json_safe
 from app.owners import plot_to_feature
 
@@ -37,30 +37,18 @@ def _local_bbox(village_id: int, x_min: float, y_min: float, x_max: float, y_max
     }
 
 
-def require_kawardha() -> Iterator[Session]:
-    if KawardhaSessionLocal is None:
-        raise HTTPException(status_code=503, detail="Kawardha PostgreSQL is not configured")
-    db = KawardhaSessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
 @router.get("/health")
-def kawardha_health() -> dict[str, str]:
-    if kawardha_engine is None:
-        return {"status": "error", "database": "not configured"}
+def kawardha_health() -> dict[str, Any]:
     try:
-        with kawardha_engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        return {"status": "ok", "database": "connected", "engine": "postgresql", "name": "kawardha_db"}
+        with engine.connect() as conn:
+            plots = conn.execute(text("SELECT COUNT(*) FROM plots")).scalar_one()
+        return {"status": "ok", "database": "connected", "engine": "mysql", "plots": int(plots)}
     except Exception as exc:
         return {"status": "error", "database": str(exc)}
 
 
 @router.get("/summary")
-def kawardha_summary(db: Session = Depends(require_kawardha)) -> dict[str, Any]:
+def kawardha_summary(db: Session = Depends(get_db)) -> dict[str, Any]:
     row = db.execute(
         text(
             """
@@ -82,7 +70,7 @@ def kawardha_summary(db: Session = Depends(require_kawardha)) -> dict[str, Any]:
 
 @router.get("/villages")
 def list_villages(
-    db: Session = Depends(require_kawardha),
+    db: Session = Depends(get_db),
     valid_geo: Annotated[bool, Query()] = False,
 ) -> dict[str, Any]:
     geo_filter = f"WHERE {VALID_GEO_SQL}" if valid_geo else ""
@@ -99,16 +87,16 @@ def list_villages(
               v.plot_count,
               COUNT(p.id) AS segment_count,
               COALESCE(SUM(p.area_ha), 0) AS area_ha,
-              COUNT(p.id) FILTER (WHERE {VALID_GEO_SQL}) AS georeferenced_plots,
-              COUNT(p.id) FILTER (WHERE {UTM_SQL}) AS utm_plots,
+              SUM(CASE WHEN {VALID_GEO_SQL} THEN 1 ELSE 0 END) AS georeferenced_plots,
+              SUM(CASE WHEN {UTM_SQL} THEN 1 ELSE 0 END) AS utm_plots,
               MIN(e.x_min) AS x_min,
               MIN(e.y_min) AS y_min,
               MAX(e.x_max) AS x_max,
               MAX(e.y_max) AS y_max,
-              MIN(e.min_lon) FILTER (WHERE {VALID_GEO_SQL}) AS real_min_lon,
-              MIN(e.min_lat) FILTER (WHERE {VALID_GEO_SQL}) AS real_min_lat,
-              MAX(e.max_lon) FILTER (WHERE {VALID_GEO_SQL}) AS real_max_lon,
-              MAX(e.max_lat) FILTER (WHERE {VALID_GEO_SQL}) AS real_max_lat
+              MIN(CASE WHEN {VALID_GEO_SQL} THEN e.min_lon END) AS real_min_lon,
+              MIN(CASE WHEN {VALID_GEO_SQL} THEN e.min_lat END) AS real_min_lat,
+              MAX(CASE WHEN {VALID_GEO_SQL} THEN e.max_lon END) AS real_max_lon,
+              MAX(CASE WHEN {VALID_GEO_SQL} THEN e.max_lat END) AS real_max_lat
             FROM villages v
             JOIN plots p ON p.village_id = v.id
             JOIN plot_extents e ON e.plot_id_fk = p.id
@@ -172,7 +160,7 @@ def _village_layout(db: Session, village_id: int) -> dict[str, float] | None:
         text(
             """
             SELECT MIN(e.x_min) AS x_min, MIN(e.y_min) AS y_min,
-                   COUNT(*) FILTER (WHERE e.x_min > 100000) AS utm_n
+                   SUM(CASE WHEN e.x_min > 100000 THEN 1 ELSE 0 END) AS utm_n
             FROM plots p
             JOIN plot_extents e ON e.plot_id_fk = p.id
             WHERE p.village_id = :village_id
@@ -193,7 +181,7 @@ def _village_layout(db: Session, village_id: int) -> dict[str, float] | None:
 
 @router.get("/plots")
 def list_plots(
-    db: Session = Depends(require_kawardha),
+    db: Session = Depends(get_db),
     village_id: Annotated[int | None, Query()] = None,
     valid_geo: Annotated[bool, Query()] = True,
     skip: Annotated[int, Query(ge=0)] = 0,
@@ -221,7 +209,7 @@ def list_plots(
             LEFT JOIN villages v ON v.id = p.village_id
             WHERE {where_sql}
             ORDER BY p.id
-            OFFSET :skip LIMIT :limit
+            LIMIT :limit OFFSET :skip
             """
         ),
         {**params, "skip": skip, "limit": limit},
@@ -239,7 +227,7 @@ def list_plots(
 
 @router.get("/plots/map")
 def map_plots(
-    db: Session = Depends(require_kawardha),
+    db: Session = Depends(get_db),
     village_id: Annotated[int | None, Query()] = None,
     valid_geo: Annotated[bool, Query()] = True,
 ) -> StreamingResponse:
@@ -260,7 +248,7 @@ def map_plots(
     def generate() -> Iterator[str]:
         yield '{"type":"FeatureCollection","features":['
         first = True
-        with kawardha_engine.connect() as conn:
+        with engine.connect() as conn:
             result = conn.execution_options(stream_results=True).execute(stmt, params)
             for row in result:
                 if not first:
@@ -273,7 +261,7 @@ def map_plots(
 
 
 @router.get("/plots/{plot_id}")
-def get_plot(plot_id: int, db: Session = Depends(require_kawardha)) -> dict[str, Any]:
+def get_plot(plot_id: int, db: Session = Depends(get_db)) -> dict[str, Any]:
     row = db.execute(
         text(
             f"""
@@ -293,7 +281,7 @@ def get_plot(plot_id: int, db: Session = Depends(require_kawardha)) -> dict[str,
 
 
 @router.get("/hierarchy")
-def cadastral_hierarchy(db: Session = Depends(require_kawardha)) -> dict[str, Any]:
+def cadastral_hierarchy(db: Session = Depends(get_db)) -> dict[str, Any]:
     rows = db.execute(
         text(
             """
