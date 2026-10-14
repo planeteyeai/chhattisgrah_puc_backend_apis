@@ -559,7 +559,7 @@ def biomass_village(
 
 @router.get("/places")
 def biomass_places() -> dict[str, Any]:
-    """Biomass for every village in 2024 and 2025."""
+    """Biomass totals for every village and every stored year."""
     global _PLACES_CACHE
     if _PLACES_CACHE is not None:
         return _PLACES_CACHE
@@ -580,17 +580,12 @@ def biomass_places() -> dict[str, Any]:
                 """
             )
         ).mappings().all()
+    years = sorted({str(int(row["year"])) for row in rows} | {"2024", "2025"})
     places: dict[str, dict[str, Any]] = {}
     for row in rows:
         name = row["village_name"] or ""
-        place = places.setdefault(
-            name,
-            {"village": name, "2024": _empty_year(), "2025": _empty_year()},
-        )
-        year_key = str(int(row["year"]))
-        if year_key not in place:
-            continue
-        bucket = place[year_key]
+        place = places.setdefault(name, {"village": name, **{year: _empty_year() for year in years}})
+        bucket = place[str(int(row["year"]))]
         fields = int(row["fields"] or 0)
         tonnes = float(row["total_tonnes"] or 0)
         area = float(row["area_ha"] or 0)
@@ -609,9 +604,9 @@ def biomass_places() -> dict[str, Any]:
         bucket[crop_key]["max_biomass"] += high
     ordered = sorted(places.values(), key=lambda item: item["village"].lower())
     for place in ordered:
-        for year_key in ("2024", "2025"):
+        for year_key in years:
             _round_year(place[year_key])
-    _PLACES_CACHE = {"count": len(ordered), "villages": ordered}
+    _PLACES_CACHE = {"count": len(ordered), "years": years, "villages": ordered}
     return _PLACES_CACHE
 
 

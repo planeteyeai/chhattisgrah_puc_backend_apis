@@ -2,7 +2,33 @@ const CROP_COLORS = {
   Rice: "#facc15",
   Sugarcane: "#22c55e",
   Cotton: "#ef4444",
+  Wheat: "#f59e0b",
+  Maize: "#fb923c",
+  Soybean: "#a16207",
+  "Arhar (Tur)": "#9333ea",
+  Mustard: "#eab308",
+  "Linseed (Tisi)": "#4f46e5",
+  "Gram (Chana)": "#16a34a",
+  "Lentil (Masoor)": "#0d9488",
+  "Fallow/Uncertain": "#9ca3af",
+  "Rice + Wheat": "#ca8a04",
+  "Rice + Mustard": "#fde047",
+  "Rice + Linseed (Tisi)": "#a3e635",
+  "Rice + Gram (Chana)": "#84cc16",
+  "Rice + Lentil (Masoor)": "#bef264",
+  "Arhar (Tur) + Mustard": "#c026d3",
+  "Arhar (Tur) + Wheat": "#7c3aed",
+  "Arhar (Tur) + Linseed (Tisi)": "#6366f1",
+  "Arhar (Tur) + Gram (Chana)": "#db2777",
+  "Arhar (Tur) + Lentil (Masoor)": "#f472b6",
+  "Maize + Wheat": "#ea580c",
+  "Maize + Linseed (Tisi)": "#0ea5e9",
+  "Maize + Mustard": "#f97316",
+  "Maize + Gram (Chana)": "#14b8a6",
+  "Maize + Lentil (Masoor)": "#06b6d4",
 };
+
+const ALL_CROPS_CARD_LIMIT = 4;
 
 const HIDDEN_CROPS = new Set(["subpixel", "tree", "uncertain"]);
 
@@ -12,7 +38,6 @@ const MONTH_NAMES = [
 ];
 const ALL_VILLAGES = "__all__";
 const ALL_CROPS = "__all_crops__";
-const VISIBLE_CROPS = ["Rice", "Sugarcane", "Cotton"];
 const DISTRICT_TREND = "__district__";
 const SUBDISTRICT_TREND = "__subdistrict__";
 
@@ -83,14 +108,7 @@ const state = {
   biomassByCropId: null,
   biomassRequest: 0,
   biomassPlaces: null,
-  biomassCompare: null,
-  biomassCompareSkip: 0,
-  biomassCompareTotal: 0,
-  biomassCompareHigher: 0,
-  biomassCompareLower: 0,
-  biomassCompareCrops: null,
-  biomassCompareVillage: "",
-  biomassCompareLoading: false,
+  biomassYears: ["2024", "2025"],
   cropPage: 0,
   cropPageSize: 40,
   cropTotal: 0,
@@ -126,7 +144,20 @@ let analysisClipBound = false;
 let cropMapReady = false;
 
 function colorFor(label) {
-  return CROP_COLORS[label] || "#6c757d";
+  if (CROP_COLORS[label]) return CROP_COLORS[label];
+  const text = String(label || "");
+  if (!text) return "#6c757d";
+  let hash = 0;
+  for (let index = 0; index < text.length; index += 1) hash = (hash * 31 + text.charCodeAt(index)) >>> 0;
+  return `hsl(${hash % 360}, 65%, 50%)`;
+}
+
+function topCropNames(entries) {
+  return entries
+    .filter(([label]) => !isHiddenCrop(label))
+    .sort((left, right) => right[1] - left[1])
+    .slice(0, ALL_CROPS_CARD_LIMIT)
+    .map(([label]) => label);
 }
 
 function isHiddenCrop(label) {
@@ -1320,7 +1351,7 @@ function renderCropDetail() {
       ["Fields", formatNumber(state.selectedCrop ? totals.allFields : summary.fields)],
     ];
     if (showsAllCrops()) {
-      VISIBLE_CROPS.forEach((name) => {
+      topCropNames(summary.labels.map((item) => [item.label, item.fields])).forEach((name) => {
         const stats = placesCropTotals(places, name);
         cards.push([`${name} · ${formatNumber(stats.area_ha, 1)} ha`, formatNumber(stats.fields)]);
       });
@@ -1343,7 +1374,7 @@ function renderCropDetail() {
   $("crop-detail-crumb").textContent = [selected.district_name, selected.subdistrict_name, periodLabel()].filter(Boolean).join(" / ");
   const cards = [["Fields", formatNumber(selected.fields)]];
   if (showsAllCrops()) {
-    VISIBLE_CROPS.forEach((name) => {
+    topCropNames(Object.entries(selected.labels || {}).map(([label, value]) => [label, value.fields])).forEach((name) => {
       const stats = cropLabelStats(selected.labels, name);
       cards.push([`${name} · ${formatNumber(stats.area_ha, 1)} ha`, formatNumber(stats.fields)]);
     });
@@ -1730,8 +1761,8 @@ function mapNote(place) {
     if (!state.cropFieldCollection) return `Loading ${place.village}…`;
     if (showsAllCrops()) {
       return shown
-        ? `${place.village} · rice, sugarcane, and cotton · ${formatNumber(shown)} fields`
-        : `${place.village} · no rice, sugarcane, or cotton fields`;
+        ? `${place.village} · all crops · ${periodLabel()} · ${formatNumber(shown)} fields`
+        : `${place.village} · no crop fields in ${periodLabel()}`;
     }
     const period = periodLabel();
     return shown
@@ -1739,7 +1770,7 @@ function mapNote(place) {
       : `${place.village} · ${area}no ${state.selectedCrop} fields in ${period}`;
   }
   if (place.village && place.village !== ALL_VILLAGES) {
-    return `${place.village} · choose rice, sugarcane, or cotton to draw those fields.`;
+    return `${place.village} · choose a crop or All crops to draw those fields.`;
   }
   if (place.subdistrict) return `${place.subdistrict} subdistrict boundary.`;
   if (place.district) return `${place.district} district boundary.`;
@@ -2451,56 +2482,19 @@ function biomassRollupFrom(bucket) {
 
 async function loadVillageBiomass() {
   const requestId = ++state.biomassRequest;
-  const place = selectedPlace();
-  const year = Number(state.cropYear);
   const jobs = [];
-  const hasVillage = Boolean(place.village && place.village !== ALL_VILLAGES && (year === 2024 || year === 2025));
-  if (hasVillage && !samePlaceName(state.biomassCompareVillage, place.village)) {
-    state.biomassCompareSkip = 0;
-    state.biomassCompareVillage = place.village;
-  }
-  state.biomassCompareLoading = hasVillage;
-  if (hasVillage) {
-    state.biomassCompare = [];
-    state.biomassCompareTotal = 0;
-    state.biomassCompareCrops = [];
-  }
+  state.biomassByCropId = new Map();
   if (state.biomassPlaces && requestId === state.biomassRequest) {
     renderVillageBiomass(null);
-  }
-  let compareJob = null;
-  if (hasVillage) {
-    const params = new URLSearchParams({
-      village: place.village,
-      skip: String(state.biomassCompareSkip || 0),
-      limit: String(BIOMASS_PAGE),
-    });
-    compareJob = readJson(`/biomass/compare?${params.toString()}`).then((body) => {
-      if (requestId !== state.biomassRequest) return;
-      state.biomassCompare = body.fields || [];
-      state.biomassCompareTotal = Number(body.total ?? body.count) || 0;
-      state.biomassCompareHigher = Number(body.higher) || 0;
-      state.biomassCompareLower = Number(body.lower) || 0;
-      state.biomassCompareCrops = body.crops || [];
-      state.biomassByCropId = new Map();
-      state.biomassCompareLoading = false;
-    });
-  } else if (requestId === state.biomassRequest) {
-    state.biomassByCropId = new Map();
-    state.biomassVillage = null;
-    state.biomassCompare = [];
-    state.biomassCompareTotal = 0;
-    state.biomassCompareCrops = [];
-    state.biomassCompareLoading = false;
   }
   if (!state.biomassPlaces) {
     jobs.push(readJson("/biomass/places").then((body) => {
       if (requestId !== state.biomassRequest) return;
       state.biomassPlaces = body.villages || [];
+      state.biomassYears = (body.years || ["2024", "2025"]).map(String);
       renderVillageBiomass(null);
     }));
   }
-  if (compareJob) jobs.push(compareJob);
   await Promise.all(jobs);
   if (requestId !== state.biomassRequest || state.analysisKind !== "biomass") return;
   const selected = selectedFieldLayer && selectedFieldLayer.feature && state.biomassByCropId
@@ -2531,7 +2525,6 @@ function biomassSourceText(source) {
 
 const BIOMASS_FONT = { family: "ui-sans-serif, system-ui, sans-serif", size: 20 };
 const BIOMASS_TITLE_FONT = { family: "ui-sans-serif, system-ui, sans-serif", size: 20, weight: "600" };
-const BIOMASS_PAGE = 25;
 const BIOMASS_SPAN = 0.15;
 
 function biomassDigits(value) {
@@ -2572,12 +2565,14 @@ function biomassRangeEnds(value) {
   return wrap;
 }
 
-function biomassVillageList(places, selectedName) {
+function biomassVillageList(places, selectedName, years) {
   const wrap = document.createElement("div");
   wrap.className = "biomass-villages";
+  const columns = `minmax(0, 0.8fr) repeat(${years.length}, 1.1fr)`;
   const head = document.createElement("div");
   head.className = "biomass-head";
-  ["Village", "2024 range", "2025 range"].forEach((text) => {
+  head.style.gridTemplateColumns = columns;
+  ["Village", ...years.map((year) => `${year} range`)].forEach((text) => {
     const cell = document.createElement("span");
     cell.textContent = text;
     head.append(cell);
@@ -2586,19 +2581,23 @@ function biomassVillageList(places, selectedName) {
   places.forEach((place) => {
     const button = document.createElement("button");
     button.type = "button";
-    const tonnes24 = biomassYear(place, 2024).tonnes;
-    const tonnes25 = biomassYear(place, 2025).tonnes;
+    button.style.gridTemplateColumns = columns;
     if (samePlaceName(place.village, selectedName)) button.className = "is-active";
     const name = document.createElement("span");
     name.className = "biomass-place-name";
     name.textContent = place.village;
-    const y24 = document.createElement("span");
-    y24.textContent = biomassRangeText(tonnes24);
-    const y25 = document.createElement("span");
-    y25.textContent = biomassRangeText(tonnes25);
-    if (tonnes25 > tonnes24) y25.className = "is-up";
-    else if (tonnes25 < tonnes24) y25.className = "is-down";
-    button.append(name, y24, y25);
+    button.append(name);
+    years.forEach((year, index) => {
+      const tonnes = biomassYear(place, year).tonnes;
+      const cell = document.createElement("span");
+      cell.textContent = biomassRangeText(tonnes);
+      if (index > 0) {
+        const before = biomassYear(place, years[index - 1]).tonnes;
+        if (tonnes > before) cell.className = "is-up";
+        else if (tonnes < before) cell.className = "is-down";
+      }
+      button.append(cell);
+    });
     button.addEventListener("click", () => selectVillagePlace(place.village));
     wrap.append(button);
   });
@@ -2627,13 +2626,6 @@ function biomassStat(label, bucket, deltaText) {
   return card;
 }
 
-function biomassPair(left, right) {
-  const row = document.createElement("div");
-  row.className = "biomass-pair";
-  row.append(left, right);
-  return row;
-}
-
 function biomassChartFonts() {
   return {
     responsive: true,
@@ -2652,110 +2644,42 @@ function biomassChartFonts() {
   };
 }
 
-function drawBiomassCompare(fields, crops) {
+const BIOMASS_SERIES = [
+  ["Total", null, "#0f766e"],
+  ["Rice", "rice", "#facc15"],
+  ["Cotton", "cotton", "#ef4444"],
+];
+
+function biomassBucketBand(bucket) {
+  const low = Number(bucket && bucket.min_biomass);
+  const high = Number(bucket && bucket.max_biomass);
+  if (low || high) return [low || 0, high || 0];
+  const band = biomassBand(bucket && bucket.tonnes);
+  return [band.min, band.max];
+}
+
+function drawVillageYearly(place, years) {
   destroyBiomassChart();
-  if (typeof Chart === "undefined") return;
-  const summary = Array.isArray(crops) ? crops : [];
-  const barLabels = [];
-  const bar2024 = [];
-  const bar2025 = [];
-  const sources = summary.length
-    ? summary.map((item) => ({
-      label: item.crop,
-      low24: Number(item.min_biomass_2024) || 0,
-      high24: Number(item.max_biomass_2024) || 0,
-      low25: Number(item.min_biomass_2025) || 0,
-      high25: Number(item.max_biomass_2025) || 0,
-    }))
-    : ["Rice", "Cotton"].map((label) => {
-      const rows = (fields || []).filter((row) => samePlaceName(row.crop, label));
-      const sum = (key) => rows.reduce((total, row) => total + (Number(row[key]) || 0), 0);
-      return {
-        label,
-        low24: sum("min_biomass_2024"),
-        high24: sum("max_biomass_2024"),
-        low25: sum("min_biomass_2025"),
-        high25: sum("max_biomass_2025"),
-      };
-    });
-  sources.forEach((item) => {
-    if (item.high24 > 0.05 || item.high25 > 0.05) {
-      barLabels.push(item.label);
-      bar2024.push([item.low24, item.high24]);
-      bar2025.push([item.low25, item.high25]);
-    }
-  });
+  if (typeof Chart === "undefined" || !place) return;
   const bar = $("biomass-bars");
-  if (bar && barLabels.length) {
-    biomassBarChart = new Chart(bar, {
-      type: "bar",
-      data: {
-        labels: barLabels,
-        datasets: [
-          { label: "2024", data: bar2024, backgroundColor: "#475569", borderRadius: 6, maxBarThickness: 72 },
-          { label: "2025", data: bar2025, backgroundColor: "#059669", borderRadius: 6, maxBarThickness: 72 },
-        ],
-      },
-      options: {
-        ...biomassChartFonts(),
-        plugins: {
-          ...biomassChartFonts().plugins,
-          tooltip: {
-            ...biomassChartFonts().plugins.tooltip,
-            callbacks: {
-              label(context) {
-                const raw = context.raw;
-                if (!Array.isArray(raw)) return context.dataset.label || "";
-                const digits = biomassDigits((raw[0] + raw[1]) / 2);
-                return `${context.dataset.label}: ${formatNumber(raw[0], digits)}–${formatNumber(raw[1], digits)} t`;
-              },
-            },
-          },
-        },
-        scales: {
-          x: { ticks: { font: BIOMASS_FONT, color: "#111827" }, grid: { display: false } },
-          y: {
-            beginAtZero: true,
-            title: { display: true, text: "Biomass (t)", font: BIOMASS_TITLE_FONT, color: "#374151" },
-            ticks: { font: BIOMASS_FONT, color: "#374151" },
-          },
-        },
-      },
-    });
-  }
-  const canvas = $("biomass-chart");
-  if (!canvas || !fields.length) return;
-  const labels = fields.map((row) => `${row.crop} ${row.field_id}`);
-  const band = (row, year) => {
-    const low = row[`min_biomass_${year}`];
-    const high = row[`max_biomass_${year}`];
-    if (low != null && high != null) return [Number(low) || 0, Number(high) || 0];
-    const number = Number(row[`tonnes_${year}`]) || 0;
-    return [number * (1 - BIOMASS_SPAN), number * (1 + BIOMASS_SPAN)];
-  };
-  biomassChart = new Chart(canvas, {
+  if (!bar) return;
+  const datasets = BIOMASS_SERIES
+    .map(([label, key, color]) => ({
+      label,
+      data: years.map((year) => {
+        const bucket = biomassYear(place, year);
+        return biomassBucketBand(key ? bucket[key] : bucket);
+      }),
+      backgroundColor: color,
+      borderRadius: 6,
+      maxBarThickness: 56,
+    }))
+    .filter((dataset) => dataset.data.some((range) => range[1] > 0.05));
+  if (!datasets.length) return;
+  biomassBarChart = new Chart(bar, {
     type: "bar",
-    data: {
-      labels,
-      datasets: [
-        {
-          label: "2024",
-          data: fields.map((row) => band(row, 2024)),
-          backgroundColor: "#475569",
-          borderRadius: 4,
-          maxBarThickness: 16,
-        },
-        {
-          label: "2025",
-          data: fields.map((row) => band(row, 2025)),
-          backgroundColor: "#059669",
-          borderRadius: 4,
-          maxBarThickness: 16,
-        },
-      ],
-    },
+    data: { labels: years, datasets },
     options: {
-      indexAxis: "y",
       ...biomassChartFonts(),
       plugins: {
         ...biomassChartFonts().plugins,
@@ -2772,14 +2696,11 @@ function drawBiomassCompare(fields, crops) {
         },
       },
       scales: {
-        x: {
-          beginAtZero: true,
-          title: { display: true, text: "Biomass range (t)", font: BIOMASS_TITLE_FONT, color: "#374151" },
-          ticks: { font: { family: BIOMASS_FONT.family, size: 14 }, color: "#374151" },
-        },
+        x: { ticks: { font: BIOMASS_FONT, color: "#111827" }, grid: { display: false } },
         y: {
-          ticks: { font: { family: BIOMASS_FONT.family, size: 14 }, color: "#111827", autoSkip: false },
-          grid: { display: false },
+          beginAtZero: true,
+          title: { display: true, text: "Village biomass (t)", font: BIOMASS_TITLE_FONT, color: "#374151" },
+          ticks: { font: BIOMASS_FONT, color: "#374151" },
         },
       },
     },
@@ -2798,39 +2719,23 @@ function biomassTotals(places, year) {
   }, { fields: 0, area_ha: 0, tonnes: 0, rice: { tonnes: 0 }, cotton: { tonnes: 0 } });
 }
 
-function biomassChangeText(before, after) {
+function biomassChangeText(before, after, beforeYear) {
   const diff = (Number(after) || 0) - (Number(before) || 0);
-  if (Math.abs(diff) < 0.05) return "Same as 2024";
-  const pct = before ? (diff / before) * 100 : 0;
+  if (Math.abs(diff) < 0.05) return `Same as ${beforeYear}`;
+  if (!before) return `New since ${beforeYear}`;
+  const pct = (diff / before) * 100;
   const sign = diff > 0 ? "+" : "";
-  return `${sign}${formatNumber(pct, 0)}% vs 2024`;
+  return `${sign}${formatNumber(pct, 0)}% vs ${beforeYear}`;
 }
 
-function biomassPager(total) {
-  const skip = state.biomassCompareSkip || 0;
-  const pages = Math.max(1, Math.ceil(total / BIOMASS_PAGE));
-  const page = Math.floor(skip / BIOMASS_PAGE) + 1;
+function biomassYearCards(yearBuckets) {
   const row = document.createElement("div");
-  row.className = "biomass-pager";
-  const previous = document.createElement("button");
-  previous.type = "button";
-  previous.textContent = "Previous";
-  previous.disabled = skip <= 0;
-  previous.addEventListener("click", () => {
-    state.biomassCompareSkip = Math.max(0, skip - BIOMASS_PAGE);
-    loadVillageBiomass().catch((error) => showBanner(error.message));
+  row.className = "biomass-pair";
+  yearBuckets.forEach(([year, bucket], index) => {
+    const previous = index > 0 ? yearBuckets[index - 1] : null;
+    const delta = previous ? biomassChangeText(previous[1].tonnes, bucket.tonnes, previous[0]) : "";
+    row.append(biomassStat(year, bucket, delta));
   });
-  const label = document.createElement("span");
-  label.textContent = `${formatNumber(page)} of ${formatNumber(pages)}`;
-  const next = document.createElement("button");
-  next.type = "button";
-  next.textContent = "Next";
-  next.disabled = skip + BIOMASS_PAGE >= total;
-  next.addEventListener("click", () => {
-    state.biomassCompareSkip = skip + BIOMASS_PAGE;
-    loadVillageBiomass().catch((error) => showBanner(error.message));
-  });
-  row.append(previous, label, next);
   return row;
 }
 
@@ -2852,10 +2757,7 @@ function renderVillageBiomass(fieldRow) {
   const places = state.biomassPlaces || [];
   const selectedName = state.cropVillage && state.cropVillage !== ALL_VILLAGES ? state.cropVillage : "";
   const selected = places.find((place) => samePlaceName(place.village, selectedName)) || null;
-  const matched = selected ? (state.biomassCompare || []) : [];
-  const matchedTotal = selected ? (state.biomassCompareTotal || 0) : 0;
-  const higher = state.biomassCompareHigher || 0;
-  const lower = state.biomassCompareLower || 0;
+  const years = state.biomassYears || ["2024", "2025"];
   const card = document.createElement("div");
   card.className = "biomass-card";
   const bandNote = document.createElement("p");
@@ -2863,17 +2765,17 @@ function renderVillageBiomass(fieldRow) {
   bandNote.textContent = "Min is 15% below the estimate. Max is 15% above it.";
   card.append(bandNote);
   if (selected) {
-    const y24 = biomassYear(selected, 2024);
-    const y25 = biomassYear(selected, 2025);
     const heading = document.createElement("p");
     heading.className = "biomass-kicker";
-    heading.textContent = selected.village;
+    heading.textContent = `${selected.village} · whole village by year`;
+    const chartNote = document.createElement("p");
+    chartNote.className = "biomass-note";
+    chartNote.textContent = "Every stored field in the village, summed per year.";
     card.append(
       heading,
-      biomassPair(
-        biomassStat("2024", y24),
-        biomassStat("2025", y25, biomassChangeText(y24.tonnes, y25.tonnes)),
-      ),
+      biomassYearCards(years.map((year) => [year, biomassYear(selected, year)])),
+      chartNote,
+      biomassFrame("biomass-chart biomass-chart-bars", "biomass-bars"),
     );
   }
   if (fieldRow) {
@@ -2883,47 +2785,6 @@ function renderVillageBiomass(fieldRow) {
     caption.textContent = `This ${fieldRow.crop} field · ${fieldRow.year} · ${formatNumber(fieldRow.area_ha, 3)} ha`;
     field.append(caption, biomassRangeEnds(fieldRow.total_tonnes));
     card.append(field);
-  }
-  if (selected && matchedTotal) {
-    const skip = state.biomassCompareSkip || 0;
-    const from = skip + 1;
-    const to = skip + matched.length;
-    const barsTitle = document.createElement("p");
-    barsTitle.className = "biomass-kicker";
-    barsTitle.textContent = "Same fields by crop";
-    const barsNote = document.createElement("p");
-    barsNote.className = "biomass-note";
-    barsNote.textContent = `${formatNumber(matchedTotal)} fields in both years · ${formatNumber(higher)} higher in 2025 · ${formatNumber(lower)} lower`;
-    const scatterTitle = document.createElement("p");
-    scatterTitle.className = "biomass-kicker";
-    scatterTitle.textContent = "Each field, 2024 and 2025";
-    const scatterNote = document.createElement("p");
-    scatterNote.className = "biomass-note";
-    scatterNote.textContent = `Showing ${formatNumber(from)}–${formatNumber(to)} of ${formatNumber(matchedTotal)}. Grey is 2024. Green is 2025.`;
-    const fieldScroll = document.createElement("div");
-    fieldScroll.className = "biomass-field-scroll";
-    const fieldChart = biomassFrame("biomass-chart biomass-chart-fields", "biomass-chart");
-    fieldChart.style.height = `${Math.max(220, matched.length * 36)}px`;
-    fieldScroll.append(fieldChart);
-    card.append(
-      barsTitle,
-      barsNote,
-      biomassFrame("biomass-chart biomass-chart-bars", "biomass-bars"),
-      scatterTitle,
-      scatterNote,
-      fieldScroll,
-      biomassPager(matchedTotal),
-    );
-  } else if (selected && state.biomassCompareLoading) {
-    const note = document.createElement("p");
-    note.className = "biomass-note";
-    note.textContent = "Loading fields…";
-    card.append(note);
-  } else if (selected) {
-    const note = document.createElement("p");
-    note.className = "biomass-note";
-    note.textContent = "No field in this village is stored in both 2024 and 2025.";
-    card.append(note);
   }
   const districtTitle = document.createElement("p");
   districtTitle.className = "biomass-kicker";
@@ -2935,22 +2796,16 @@ function renderVillageBiomass(fieldRow) {
     waiting.textContent = "Loading village totals…";
     card.append(waiting);
   } else {
-    const district24 = biomassTotals(places, 2024);
-    const district25 = biomassTotals(places, 2025);
-    card.append(biomassPair(
-      biomassStat("2024", district24),
-      biomassStat("2025", district25, biomassChangeText(district24.tonnes, district25.tonnes)),
-    ));
-    if (places.length) card.append(biomassVillageList(places, selectedName));
+    card.append(biomassYearCards(years.map((year) => [year, biomassTotals(places, year)])));
+    if (places.length) card.append(biomassVillageList(places, selectedName, years));
   }
   legend.replaceChildren(card);
   const active = card.querySelector(".biomass-villages .is-active");
   if (active) active.scrollIntoView({ block: "nearest" });
-  if (matched.length) drawBiomassCompare(matched, state.biomassCompareCrops);
+  if (selected) drawVillageYearly(selected, years);
   if (fieldRow) setStoreStatus(biomassSourceText(fieldRow.rate_source));
-  else if (!selected) setStoreStatus("Choose a village, then click a rice or cotton field.");
-  else if (Number(state.cropYear) !== 2024 && Number(state.cropYear) !== 2025) setStoreStatus("Biomass is stored for 2024 and 2025.");
-  else setStoreStatus("Click a field to see that plot.");
+  else if (!selected) setStoreStatus("Choose a village to compare its biomass year by year.");
+  else setStoreStatus(`Village biomass for ${years.join(", ")}.`);
 }
 
 function renderFieldBiomass(row) {
