@@ -47,6 +47,10 @@ def mysql_connect_args(url: str, ssl_flag: str = "") -> dict[str, object]:
     return args
 
 
+def _is_placeholder(url: str) -> bool:
+    return any(token in url for token in ("USER:PASSWORD", "@HOST", ":PORT/"))
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -82,10 +86,13 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def require_database(self) -> "Settings":
-        if not self.database_url:
+        if not self.database_url or _is_placeholder(self.database_url):
             self.database_url = os.environ.get("MYSQL_URL", "")
-        if not self.database_url:
-            raise ValueError("Set DATABASE_URL to the MySQL connection string")
+        if not self.database_url or _is_placeholder(self.database_url):
+            raise ValueError(
+                "DATABASE_URL is missing or still the .env.example placeholder; "
+                "set it to the MySQL connection string (on Railway: ${{MySQL.MYSQL_URL}})"
+            )
         return self
 
     @property
