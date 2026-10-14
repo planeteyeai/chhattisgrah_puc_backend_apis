@@ -1,0 +1,25 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.idea
+.vscode
+*.log
+.DS_Store
+Thumbs.db
+*.kml
+*.joblib
+all_crops_villages/
+kabirdham_run.py
+cropmodeland identification
+identification_progress.json
+*credentials*.json
+service-account*.json
+*.pem

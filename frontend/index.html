@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kabirdham Crop Monitoring</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="/static/styles.css?v=mega42">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-name">
+        <span class="brand-strong">Kabirdham</span>
+        <span class="brand-soft">Crop Monitoring</span>
+      </div>
+      <p class="brand-sub">Precision intelligence</p>
+    </div>
+    <nav class="views" aria-label="Dashboard sections">
+      <button type="button" class="view-tab is-active" data-view="crops">Map explore</button>
+      <button type="button" class="view-tab" data-view="cadastral">Records</button>
+      <button type="button" class="view-tab" data-view="indices">Dashboard</button>
+    </nav>
+  </header>
+
+  <p id="banner" class="banner" hidden></p>
+
+  <main id="view-cadastral" class="shell" hidden>
+    <aside class="side-panel">
+      <div class="panel-head">
+        <h2>Hierarchy</h2>
+        <p id="hierarchy-totals" class="muted">Loading villages…</p>
+      </div>
+      <label class="search">
+        <span class="sr">Search hierarchy</span>
+        <input id="tree-search" type="search" placeholder="Search tehsil, RI, or village" autocomplete="off">
+      </label>
+      <label class="check">
+        <input id="plots-only" type="checkbox">
+        Villages with stored plots
+      </label>
+      <div id="tree" class="tree" role="tree"></div>
+    </aside>
+    <section class="map-stage">
+      <div id="map" role="region" aria-label="Cadastral map"></div>
+      <p id="map-note" class="map-note" hidden></p>
+    </section>
+    <aside class="float-card">
+      <div class="panel-head">
+        <h2 id="detail-title">Selection</h2>
+        <p id="detail-crumb" class="muted">Choose a village in the hierarchy.</p>
+      </div>
+      <div id="detail" class="detail"></div>
+    </aside>
+    <section class="bottom-dock">
+      <div class="panel-head row">
+        <div>
+          <h2>Plots</h2>
+          <p id="plot-count" class="muted">No village selected</p>
+        </div>
+        <div id="plot-pager" class="pager"></div>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Plot</th>
+              <th>Khasra</th>
+              <th>Area ha</th>
+              <th>Land use</th>
+              <th>Owner</th>
+              <th>Position</th>
+            </tr>
+          </thead>
+          <tbody id="plot-rows">
+            <tr><td colspan="6" class="empty">Select a village to list its parcels.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <main id="view-crops" class="shell">
+    <aside class="side-panel">
+      <div class="panel-head">
+        <p id="place-kicker" class="panel-kicker">District</p>
+        <h2 id="place-heading">Subdistrict</h2>
+      </div>
+      <div class="place-filters">
+        <label>District
+          <select id="place-district"></select>
+        </label>
+        <label>Subdistrict
+          <select id="place-subdistrict"></select>
+        </label>
+        <label>Village
+          <select id="place-village"></select>
+        </label>
+        <label>Year
+          <select id="place-year"></select>
+        </label>
+        <label>Month
+          <select id="place-month"></select>
+        </label>
+      </div>
+      <fieldset class="layer-toggles">
+        <legend>Map layers</legend>
+        <label class="check"><input id="layer-villages" type="checkbox" checked> Village boundaries</label>
+      </fieldset>
+      <p class="legend-label">Analysis</p>
+      <div class="analysis-layers" id="analysis-layers">
+        <button type="button" data-analysis="growth">Growth</button>
+        <button type="button" data-analysis="water">Water uptake</button>
+        <button type="button" data-analysis="soil">Soil moisture</button>
+        <button type="button" data-analysis="pest">Pest</button>
+        <button type="button" data-analysis="biomass">Biomass</button>
+      </div>
+      <p class="legend-label">Show one crop</p>
+      <div id="crop-legend" class="legend"></div>
+    </aside>
+    <section class="map-stage">
+      <div id="crop-map" role="region" aria-label="Field boundary map"></div>
+      <p id="crop-map-note" class="map-note">Loading Kawardha…</p>
+    </section>
+    <aside class="float-card">
+      <div class="panel-head">
+        <h2 id="crop-detail-title">Kawardha</h2>
+        <p id="crop-detail-crumb" class="muted">Kabirdham / Kawardha</p>
+      </div>
+      <div id="crop-detail" class="detail"></div>
+      <div id="analysis-panel" class="analysis-panel">
+        <p id="analysis-panel-title" class="legend-label">Class share</p>
+        <p id="analysis-plot" class="muted">Choose a layer on the left.</p>
+        <div class="analysis-pie"><canvas id="analysis-pie"></canvas></div>
+        <div id="analysis-legend" class="analysis-legend"></div>
+        <p id="analysis-store-status" class="analysis-status"></p>
+      </div>
+    </aside>
+  </main>
+
+  <main id="view-indices" class="shell shell-indices" hidden>
+    <aside class="side-panel">
+      <div class="panel-head">
+        <p class="panel-kicker">Sentinel-2 L2A</p>
+        <h2>Index trends</h2>
+        <p id="index-range" class="muted">Choose a district, subdistrict, or village.</p>
+      </div>
+      <div class="place-filters">
+        <label>District
+          <select id="index-district"></select>
+        </label>
+        <label>Subdistrict
+          <select id="index-subdistrict"></select>
+        </label>
+        <label>Village
+          <select id="index-village"></select>
+        </label>
+        <label>Frequency
+          <select id="index-frequency">
+            <option value="monthly" selected>Monthly</option>
+            <option value="weekly">Weekly</option>
+            <option value="yearly">Yearly</option>
+          </select>
+        </label>
+      </div>
+    </aside>
+    <section id="index-board" class="index-board"></section>
+  </main>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.6/dist/chart.umd.min.js"></script>
+  <script src="/static/app.js?v=mega43"></script>
+</body>
+</html>
