@@ -69,6 +69,8 @@ SEASON_START_MONTH = 6
 SEASON_START_DAY = 1
 IDENTIFICATION_MONTH = 9
 WINDOW_REACH_DAYS = 60
+# Scale model output before storage; ±15% band is applied on the scaled exact value.
+BIOMASS_SCALE = 0.64
 BIOMASS_MIN_FACTOR = 0.85
 BIOMASS_MAX_FACTOR = 1.15
 SEASON_YEAR = re.compile(r"(\d{4})")
@@ -182,8 +184,13 @@ def latest_scene_date(scenes: Scenes, start: date, end: date) -> date | None:
     return max(found) if found else None
 
 
+def scale_biomass(value: float) -> float:
+    """Apply the storage scale factor to an exact biomass value (t/ha or tonnes)."""
+    return float(value or 0.0) * BIOMASS_SCALE
+
+
 def biomass_bounds(total_tonnes: float) -> tuple[float, float]:
-    """15% below and 15% above the stored biomass, in tonnes."""
+    """15% below and 15% above the stored (already scaled) biomass, in tonnes."""
     total = float(total_tonnes or 0.0)
     return round(total * BIOMASS_MIN_FACTOR, 6), round(total * BIOMASS_MAX_FACTOR, 6)
 
@@ -483,9 +490,12 @@ def store_biomass(
         area = float(row["area_ha"] or 0)
         kharif = next((part for part in parts if CALENDAR_SEASON.get(part[0]) == "kharif"), None)
         rabi = next((part for part in parts if CALENDAR_SEASON.get(part[0]) == "rabi"), None)
-        tonnes_per_ha = sum(part[2] for part in parts)
+        # Exact stored values are model output × BIOMASS_SCALE; ±15% uses those scaled figures.
+        tonnes_per_ha = scale_biomass(sum(part[2] for part in parts))
         total = round(tonnes_per_ha * area, 6)
         min_biomass, max_biomass = biomass_bounds(total)
+        kharif_t_ha = scale_biomass(kharif[2]) if kharif else None
+        rabi_t_ha = scale_biomass(rabi[2]) if rabi else None
         sources = {part[6] for part in parts}
         source = sources.pop() if len(sources) == 1 else "mixed"
         season_end = max(part[5] for part in parts)
@@ -500,11 +510,11 @@ def store_biomass(
                 "season": row["season"],
                 "crop": label,
                 "kharif_crop": kharif[0] if kharif else None,
-                "kharif_t_ha": round(kharif[2], 6) if kharif else None,
-                "kharif_tonnes": round(kharif[2] * area, 6) if kharif else None,
+                "kharif_t_ha": round(kharif_t_ha, 6) if kharif_t_ha is not None else None,
+                "kharif_tonnes": round(kharif_t_ha * area, 6) if kharif_t_ha is not None else None,
                 "rabi_crop": rabi[0] if rabi else None,
-                "rabi_t_ha": round(rabi[2], 6) if rabi else None,
-                "rabi_tonnes": round(rabi[2] * area, 6) if rabi else None,
+                "rabi_t_ha": round(rabi_t_ha, 6) if rabi_t_ha is not None else None,
+                "rabi_tonnes": round(rabi_t_ha * area, 6) if rabi_t_ha is not None else None,
                 "year": year,
                 "observation_date": season_end,
                 "season_start": min(part[4] for part in parts),
