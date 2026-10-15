@@ -13,6 +13,14 @@ router = APIRouter(prefix="/crops", tags=["crops"])
 
 CHUNK_KEY = re.compile(r"r(\d+)c(\d+)", re.I)
 
+# Tree / subpixel / unclassified labels are never returned from crop APIs.
+EXCLUDED_LABEL_SQL = (
+    "final_label IS NOT NULL "
+    "AND TRIM(final_label) <> '' "
+    "AND LOWER(TRIM(final_label)) NOT IN "
+    "('fallow/uncertain', 'tree', 'subpixel', 'uncertain', 'unclassified')"
+)
+
 
 def api_value(value: Any) -> Any:
     if isinstance(value, date):
@@ -35,14 +43,14 @@ def period_filter(year: int | None, month: int | None) -> tuple[str, dict[str, A
     if year is not None and not 1900 <= year <= 2100:
         raise HTTPException(status_code=400, detail="year is out of range")
     if year is None:
-        return "1=1", {}
+        return EXCLUDED_LABEL_SQL, {}
     start = date(year, month or 1, 1)
     if month is None or month == 12:
         end = date(year + 1, 1, 1)
     else:
         end = date(year, month + 1, 1)
     return (
-        "observation_date >= :period_from AND observation_date < :period_to",
+        f"observation_date >= :period_from AND observation_date < :period_to AND {EXCLUDED_LABEL_SQL}",
         {"period_from": start, "period_to": end},
     )
 
@@ -83,10 +91,11 @@ def _filters(
 def crop_periods(db: Session = Depends(get_db)) -> dict[str, Any]:
     rows = db.execute(
         text(
-            """
+            f"""
             SELECT YEAR(observation_date) AS year, MONTH(observation_date) AS month,
                    COUNT(*) AS fields, COALESCE(SUM(area_ha), 0) AS area_ha
             FROM crop_identification
+            WHERE {EXCLUDED_LABEL_SQL}
             GROUP BY YEAR(observation_date), MONTH(observation_date)
             ORDER BY year, month
             """

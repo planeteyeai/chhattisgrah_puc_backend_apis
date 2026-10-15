@@ -14,12 +14,12 @@ __pycache__
 *.log
 .DS_Store
 Thumbs.db
+data/
+docs/
+pipelines/
+scripts/
 *.kml
 *.joblib
-all_crops_villages/
-kabirdham_run.py
-cropmodeland identification
-identification_progress.json
 *credentials*.json
 service-account*.json
 *.pem

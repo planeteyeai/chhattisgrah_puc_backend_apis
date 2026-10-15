@@ -5,15 +5,14 @@ Extracted from the tested and working Colab notebook.
 Updated for 2025 and 2026 seasons.
 
 Put these files in the same folder:
-  - kabirdham_run.py                         (this file)
+  - pipelines/crop_identification/kabirdham_run.py
   - crop_classifier_model_full.joblib
   - crop_classifier_model_sugarcane_xgb.joblib
   - Kabirdham_field_boundaries_by_village.zip
 
-Run:
-  python kabirdham_run.py                    (Kharif 2025)
-  python kabirdham_run.py --year 2026        (Kharif 2026)
-  python kabirdham_run.py --rice_year 2025 --rice_month 9 --sc_year 2025 --sc_month 11
+Run from repository root:
+  python pipelines/crop_identification/kabirdham_run.py
+  python pipelines/crop_identification/kabirdham_run.py --year 2026
 
 If interrupted, just run again — progress is saved after every village.
 """

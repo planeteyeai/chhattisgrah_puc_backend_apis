@@ -1,8 +1,8 @@
 """Copy every table (schema + data) and view from one MySQL database to another.
 
-Usage:
-    python migrate_mysql.py --inspect
-    python migrate_mysql.py --target "mysql://root:PASS@HOST.proxy.rlwy.net:PORT/railway"
+Usage (from repository root):
+    python scripts/migrate_mysql.py --inspect
+    python scripts/migrate_mysql.py --target "mysql://root:PASS@HOST.proxy.rlwy.net:PORT/railway"
 
 The source defaults to DATABASE_URL from .env. Existing tables on the target
 with the same name are dropped and recreated.
@@ -11,10 +11,13 @@ with the same name are dropped and recreated.
 import argparse
 import sys
 import time
+from pathlib import Path
 
 import pymysql
 import pymysql.cursors
 from sqlalchemy.engine import make_url
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.config import mysql_connect_args, normalize_mysql_url, settings
 

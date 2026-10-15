@@ -133,28 +133,32 @@ Digits: 0 when the value is at least 100, 1 when it is at least 10, otherwise 2.
 
 - `scenes` — “Calculated from this village's Sentinel-2 scenes.”
 - `village_average` — “This village had no scenes, so the rate is the average of villages that did.”
+- `mixed` — “One season used this village's scenes. The other used the average of villages with scenes.”
+
+Every identified crop has biomass, each with its own formula (`GET /biomass/crops`). A double crop such as `Rice + Wheat` stores the Kharif part (`kharif_crop`, `kharif_tonnes`) and the Rabi part (`rabi_crop`, `rabi_tonnes`). `total_tonnes` is both. `year` is the Kharif year, so Rabi 2023-24 is 2023. `Fallow/Uncertain` has no biomass.
 
 ### Biomass panel
 
 1. Short note: min is 15% below the estimate, max is 15% above it.
-2. Selected village card: 2024 and 2025 side by side. Each card shows Min, Max, Rice, and Cotton. The 2025 card also shows the percent change versus 2024.
-3. Clicked field: crop, year, exact hectares, then Min and Max. No t/ha.
-4. Same-field chart for the selected village. Crop bars use the full village (`crops` in the compare response), not the current page. Field bars show 25 fields at a time, horizontal, grey 2024 and green 2025. Previous / Next. Label: “Showing 1–25 of 390”. Totals, “higher in 2025”, and “lower” come from the response, not from the 25 rows on screen.
-5. All-villages card: sum of every village for 2024 and 2025, same Min / Max / Rice / Cotton layout. Load `GET /biomass/places` before drawing this card. An empty list is not zero biomass.
-6. Scrollable village list. Each row is the village name plus the 2024 range and the 2025 range. Clicking a row selects that village.
+2. Selected village card: load `GET /biomass/compare?village=…`. One card per year with Min/Max, t/ha, field count, top crops, and % change versus the previous year. Compare villages year by year — never match the same field_id across years.
+3. Clicked field: detail only (crop, year, hectares, Min/Max). Not used for year-to-year compare.
+4. Village chart: whole-village biomass per year, Total plus the six biggest crops.
+5. All-villages card: sum of every village per year, same layout. Load `GET /biomass/places` before drawing this card. An empty list is not zero biomass.
+6. Scrollable village list. Each row is the village name plus one range per year. Clicking a row selects that village.
 
 ### Biomass endpoints
 
 | Call | Use |
 |---|---|
-| `GET /biomass/places` | All 176 villages, both years, rice and cotton. Includes `min_biomass` and `max_biomass`. Not paged. |
-| `GET /biomass/summary?year=2025` | District total. Optional `crop=Rice`. Includes `min_biomass` and `max_biomass`. 2025 rice is about 38,928.83 t, min 33,089.51, max 44,768.16. |
-| `GET /biomass/compare?village=Agarikalan&skip=0&limit=25` | Fields present in both 2024 and 2025. `total` is every match. `fields` is one page. `crops`, `higher`, and `lower` cover the full village. |
+| `GET /biomass/places` | Every village, every year. Each year has totals plus `crops` (one entry per single crop; a `Rice + Wheat` field adds to Rice and to Wheat). Not paged. |
+| `GET /biomass/summary?year=2025` | District totals per identified label in `results`, per single crop in `by_crop`. Optional `crop=Wheat`. |
+| `GET /biomass/compare?village=Agarikalan` | Whole-village biomass year by year: `totals` and `crops`, each year with `tonnes`, `biomass_t_ha`, Min / Max, and change versus the previous year. Optional `crop=Rice`. |
+| `GET /biomass/crops` | Formula, RUE, season window, and index for every crop. |
 | `GET /biomass/village?village=Agarikalan&year=2025&skip=0&limit=100` | Village totals plus one page of `records`. `fields` is the full count. |
 | `GET /biomass/field?field_id=17&village=Agarikalan&year=2025` | One plot. `field_id` is the plot number in that village. Add `crop=Rice` when the plot has more than one crop. |
-| `GET /biomass/fields?year=2025&subdistrict=Kawardha&skip=0&limit=100` | Every biomass row in the subdistrict, one page. Add `village=Agarikalan` for one village. Optional `crop=Rice`. |
+| `GET /biomass/fields?year=2025&subdistrict=Kawardha&skip=0&limit=100` | Every biomass row in the subdistrict, one page. Add `village=Agarikalan` for one village. Optional `crop=Wheat` also matches `Rice + Wheat`. |
 
-Compare and village lists default to 100 rows and accept up to 1,000. The chart uses 25. A page does not drop the rest of the data: `total` is the full count.
+Village and field lists default to 100 rows and accept up to 1,000. A page does not drop the rest of the data: `total` is the full count.
 
 Walk pages until `has_more` is false:
 
@@ -166,8 +170,6 @@ repeat
   stop when has_more is false
   skip = next_skip
 ```
-
-Same-field match key is `village_name + field_id + crop`. Do not match years with `field_boundary_id`.
 
 ## All fields and one village
 
@@ -208,7 +210,4 @@ Default charts: NDVI, EVI, GNDVI, NDMI, SAVI, NDWI McFeeters. The full series ke
 
 ## Numbers already checked
 
-- 176 villages in `/biomass/places`.
-- Agarikalan rice: 390 fields exist in both 2024 and 2025.
-- 2025 biomass in Kawardha: 39,529 rows. Page them.
 - 2025 crop fields in Kawardha: 270,348 rows. Page them. Do not draw all of them on the map.

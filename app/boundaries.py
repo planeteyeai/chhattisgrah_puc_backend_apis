@@ -16,6 +16,17 @@ router = APIRouter(tags=["boundaries"])
 
 BLOCK = re.compile(r"^r(\d+)c(\d+)$", re.I)
 
+# Never return tree / subpixel parcels or unclassified crop labels in field responses.
+CROPLAND_CLASS_SQL = (
+    "LOWER(TRIM(COALESCE(f.`class`, ''))) NOT IN ('tree', 'subpixel')"
+)
+IDENTIFIED_CROP_SQL = (
+    "c.final_label IS NOT NULL "
+    "AND TRIM(c.final_label) <> '' "
+    "AND LOWER(TRIM(c.final_label)) NOT IN "
+    "('fallow/uncertain', 'tree', 'subpixel', 'uncertain', 'unclassified')"
+)
+
 
 class BoundaryRequest(BaseModel):
     district_name: str = Field(..., examples=["Chhattisgarh"])
@@ -306,16 +317,35 @@ def stream_village_fields(district_name: str, subdistrict_name: str, village_nam
         )
     stored_village = match["village_name"]
     statement = text(
-        """
+        f"""
         SELECT f.id, f.field_id, f.village_id, f.village_name, f.sub_dist, f.district,
                f.area_ha, f.`class`, f.geom_geojson, c.final_label, c.predicted_crop, c.is_rice
         FROM field_boundaries f
-        LEFT JOIN crop_identification c ON c.field_boundary_id = f.id
+        INNER JOIN crop_identification c ON c.field_boundary_id = f.id
         WHERE f.chunk_id = :chunk_id AND f.village_name = :village_name
+          AND {CROPLAND_CLASS_SQL}
+          AND {IDENTIFIED_CROP_SQL}
         ORDER BY f.field_id, f.id
         """
     )
     params = {"chunk_id": block["chunk_id"], "village_name": stored_village}
+    with engine.connect() as conn:
+        field_count = int(
+            conn.execute(
+                text(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM field_boundaries f
+                    INNER JOIN crop_identification c ON c.field_boundary_id = f.id
+                    WHERE f.chunk_id = :chunk_id AND f.village_name = :village_name
+                      AND {CROPLAND_CLASS_SQL}
+                      AND {IDENTIFIED_CROP_SQL}
+                    """
+                ),
+                params,
+            ).scalar()
+            or 0
+        )
 
     def generate() -> Iterator[str]:
         header = {
@@ -324,7 +354,7 @@ def stream_village_fields(district_name: str, subdistrict_name: str, village_nam
             "district_name": block["district_name"],
             "subdistrict_name": block["subdistrict_name"],
             "village_name": stored_village,
-            "count": match["fields"],
+            "count": field_count,
         }
         prefix = json.dumps(header, ensure_ascii=False)
         yield prefix[:-1] + ',"features":['
@@ -576,7 +606,7 @@ def stream_crop_period_fields(
         "period_to": end,
     }
     statement = text(
-        """
+        f"""
         SELECT c.id, c.field_boundary_id, c.field_id, c.village_name, c.subdistrict_name, c.district_name,
                c.area_ha, c.final_label, c.predicted_crop, c.is_rice,
                COALESCE(f.geom_geojson, c.geom_geojson) AS geom_geojson
@@ -587,6 +617,8 @@ def stream_crop_period_fields(
           AND c.village_name = :village_name
           AND c.observation_date >= :period_from
           AND c.observation_date < :period_to
+          AND {IDENTIFIED_CROP_SQL}
+          AND (f.id IS NULL OR {CROPLAND_CLASS_SQL})
         ORDER BY c.field_id, c.id
         """
     )
@@ -671,14 +703,16 @@ def stream_named_village_fields(
         )
     stored_village = match["village_name"] if match else admin_match["village_name"]
     statement = text(
-        """
+        f"""
         SELECT f.id, f.field_id, f.village_id, f.village_name, f.sub_dist, f.district,
                f.area_ha, f.`class`, f.geom_geojson, c.final_label, c.predicted_crop, c.is_rice
         FROM field_boundaries f
-        LEFT JOIN crop_identification c ON c.field_boundary_id = f.id
+        INNER JOIN crop_identification c ON c.field_boundary_id = f.id
         WHERE f.district = :district
           AND f.sub_dist = :subdistrict
           AND f.village_name = :village_name
+          AND {CROPLAND_CLASS_SQL}
+          AND {IDENTIFIED_CROP_SQL}
         ORDER BY f.field_id, f.id
         """
     )
@@ -687,13 +721,32 @@ def stream_named_village_fields(
         "subdistrict": block["subdistrict_name"],
         "village_name": stored_village,
     }
+    with engine.connect() as conn:
+        field_count = int(
+            conn.execute(
+                text(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM field_boundaries f
+                    INNER JOIN crop_identification c ON c.field_boundary_id = f.id
+                    WHERE f.district = :district
+                      AND f.sub_dist = :subdistrict
+                      AND f.village_name = :village_name
+                      AND {CROPLAND_CLASS_SQL}
+                      AND {IDENTIFIED_CROP_SQL}
+                    """
+                ),
+                params,
+            ).scalar()
+            or 0
+        )
     header = {
         "type": "FeatureCollection",
         "level": "fields",
         "district_name": block["district_name"],
         "subdistrict_name": block["subdistrict_name"],
         "village_name": stored_village,
-        "count": match["fields"] if match else 0,
+        "count": field_count,
     }
     return StreamingResponse(iter_features(statement, params, header), media_type="application/geo+json")
 

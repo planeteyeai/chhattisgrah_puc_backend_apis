@@ -1,8 +1,11 @@
-"""Load all_crops_villages KMLs into crop_identification.
+"""Load village KMLs from data/all_crops_villages into crop_identification.
 
-Each placemark is matched to the field_boundaries polygon that contains its
-centroid. The stored village, district, and field id come from that polygon.
-Rows are upserted on (field_boundary_id, season).
+The KML village name is not the cadastral village. Each placemark is matched
+to a field_boundaries row with the same field_id in a village whose extent
+covers the placemark centroid. When several villages share that field_id, the
+field whose first vertex lies nearest the centroid is used. The stored
+village, district, and field id come from that row. Rows are upserted on
+(field_boundary_id, season).
 
 Kharif 2024, 2025, and 2026 rows are not updated or deleted. The table is not
 altered.
@@ -17,17 +20,15 @@ import sys
 from datetime import date
 from pathlib import Path
 
-from shapely.geometry import Point, shape
-from shapely.strtree import STRtree
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from app.database import engine  # noqa: E402
 
-KML_DIR = ROOT / "all_crops_villages"
+KML_DIR = ROOT / "data" / "all_crops_villages"
 DATA_RE = re.compile(r'<Data name="([^"]+)"><value>([^<]*)</value>')
 YEAR_RE = re.compile(r"(20\d{2})")
 
@@ -126,47 +127,28 @@ def load_admin_boxes() -> list[dict]:
     return list(merged.values())
 
 
-def overlapping_villages(boxes: list[dict], min_lon: float, min_lat: float, max_lon: float, max_lat: float) -> list[str]:
+BOX_PAD = 0.01
+
+
+def villages_at(boxes: list[dict], lon: float, lat: float) -> list[str]:
     names = []
     for box in boxes:
-        if box["max_lon"] < min_lon or box["min_lon"] > max_lon:
+        if box["max_lon"] + BOX_PAD < lon or box["min_lon"] - BOX_PAD > lon:
             continue
-        if box["max_lat"] < min_lat or box["min_lat"] > max_lat:
+        if box["max_lat"] + BOX_PAD < lat or box["min_lat"] - BOX_PAD > lat:
             continue
         names.append(box["village_name"])
     return names
 
 
-def parse_field(row) -> dict | None:
-    try:
-        geom = shape(json.loads(row["geom_geojson"]))
-        if not geom.is_valid:
-            geom = geom.buffer(0)
-        if geom.is_empty:
-            return None
-    except Exception:
-        return None
-    return {
-        "geom": geom,
-        "id": int(row["id"]),
-        "field_id": None if row["field_id"] is None else int(row["field_id"]),
-        "district": row["district"],
-        "sub_dist": row["sub_dist"],
-        "village_name": row["village_name"],
-        "area_ha": float(row["area_ha"]) if row["area_ha"] is not None else None,
-    }
-
-
-def load_fields_for_villages(names: set[str]) -> dict[str, list[dict]]:
-    """Read field polygons by primary-key ranges so each row is scanned once."""
-    grouped = {name: [] for name in names}
-    if not names:
-        return grouped
+def load_field_index() -> dict[tuple[str, int], list[dict]]:
+    """Field identity only. Polygons are loaded later for the few ambiguous plots."""
     with engine.connect() as conn:
         min_id, max_id = conn.execute(text("SELECT MIN(id), MAX(id) FROM field_boundaries")).one()
+    index: dict[tuple[str, int], list[dict]] = {}
     if min_id is None:
-        return grouped
-    step = 4000
+        return index
+    step = 8000
     cursor = int(min_id)
     last = int(max_id)
     loaded = 0
@@ -175,53 +157,102 @@ def load_fields_for_villages(names: set[str]) -> dict[str, list[dict]]:
             rows = conn.execute(
                 text(
                     """
-                    SELECT id, field_id, district, sub_dist, village_name, area_ha, geom_geojson
+                    SELECT id, field_id, district, sub_dist, village_name, area_ha,
+                           SUBSTRING(geom_geojson, 1, 160) AS head
                     FROM field_boundaries
-                    WHERE id >= :start AND id < :stop AND geom_geojson IS NOT NULL
+                    WHERE id >= :start AND id < :stop
                     """
                 ),
                 {"start": cursor, "stop": cursor + step},
             ).mappings().all()
-        kept = 0
         for row in rows:
-            if row["village_name"] not in names:
+            if row["field_id"] is None or not row["village_name"] or not row["district"]:
                 continue
-            field = parse_field(row)
-            if field is None:
-                continue
-            grouped[row["village_name"]].append(field)
-            kept += 1
-        loaded += kept
-        print(f"  fields id {cursor}-{cursor + step - 1}: kept {kept}, total {loaded}", flush=True)
+            field = {
+                "id": int(row["id"]),
+                "field_id": int(row["field_id"]),
+                "district": row["district"],
+                "sub_dist": row["sub_dist"],
+                "village_name": row["village_name"],
+                "area_ha": float(row["area_ha"]) if row["area_ha"] is not None else None,
+                "vertex": first_vertex(row["head"]),
+            }
+            index.setdefault((field["village_name"], field["field_id"]), []).append(field)
+            loaded += 1
+        print(f"  identity id {cursor}-{cursor + step - 1}: total {loaded}", flush=True)
         cursor += step
-    return grouped
+    return index
 
 
-def choose_hit(hits: list[dict], field_id: int, area_ha: float | None) -> dict | None:
-    if not hits:
+VERTEX_RE = re.compile(r"\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)")
+MAX_VERTEX_DEG = 0.005
+
+
+def first_vertex(head: str | None) -> tuple[float, float] | None:
+    if not head:
         return None
-    if len(hits) == 1:
-        return hits[0]
-    same_id = [hit for hit in hits if hit["field_id"] == field_id]
-    if len(same_id) == 1:
-        return same_id[0]
-    pool = same_id or hits
-    if area_ha is None:
+    match = VERTEX_RE.search(head)
+    if not match:
         return None
+    return float(match.group(1)), float(match.group(2))
 
-    def distance(hit: dict) -> float:
-        other = hit["area_ha"] or 0.0
-        if other <= 0:
-            return 999.0
-        return abs(other - area_ha) / max(other, area_ha)
 
-    ranked = sorted(pool, key=distance)
-    if distance(ranked[0]) > 0.5:
+def nearest_hit(hits: list[dict], lon: float, lat: float) -> dict | None:
+    """A field's first vertex sits within a few hundred metres of its centroid."""
+    ranked = []
+    for hit in hits:
+        vertex = hit.get("vertex")
+        if vertex is None:
+            continue
+        ranked.append(((vertex[0] - lon) ** 2 + (vertex[1] - lat) ** 2, hit))
+    if not ranked:
         return None
-    return ranked[0]
+    ranked.sort(key=lambda item: item[0])
+    best_d, best = ranked[0]
+    if best_d ** 0.5 > MAX_VERTEX_DEG:
+        return None
+    if len(ranked) > 1 and ranked[1][0] ** 0.5 <= MAX_VERTEX_DEG:
+        return None
+    return best
 
 
-def collect(boxes: list[dict]) -> tuple[list[dict], dict]:
+def remember(seen: dict[tuple[int, str], dict], stats: dict, built: dict) -> None:
+    key = (built["field_boundary_id"], built["season"])
+    previous = seen.get(key)
+    if previous is not None:
+        stats["duplicate_field"] += 1
+        if (built["confidence"] or 0) > (previous["confidence"] or 0):
+            seen[key] = built
+        return
+    seen[key] = built
+
+
+def kml_sources():
+    for path in sorted(KML_DIR.glob("*.kml")):
+        yield path.name, iter_placemarks(path)
+
+
+def progress_sources(path: Path):
+    """Results saved by kabirdham_all_crops_run.py, in the same shape as KML placemarks."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for village, result in sorted((data.get("results") or {}).items()):
+        placemarks = []
+        for item in result.get("predictions") or []:
+            placemarks.append({
+                "field_id": str(item.get("field_id") or ""),
+                "village": item.get("village") or village,
+                "crop": item.get("final_label") or "",
+                "confidence": "" if item.get("confidence") is None else str(item["confidence"]),
+                "source": item.get("source_model") or "",
+                "area_ha": "" if item.get("area_ha") is None else str(item["area_ha"]),
+                "centroid_lon": str(item.get("centroid_lon", "")),
+                "centroid_lat": str(item.get("centroid_lat", "")),
+                "season": item.get("season") or "",
+            })
+        yield village, placemarks
+
+
+def collect(boxes: list[dict], sources) -> tuple[list[dict], dict]:
     stats = {
         "files": 0,
         "placemarks": 0,
@@ -232,18 +263,16 @@ def collect(boxes: list[dict]) -> tuple[list[dict], dict]:
         "rejected": 0,
         "villages_loaded": 0,
     }
-    rows: list[dict] = []
     seen: dict[tuple[int, str], dict] = {}
     identified_on = date.today()
-    files: list[tuple[Path, list, list[str]]] = []
-    needed: set[str] = set()
+    files: list[tuple[str, list]] = []
 
-    for path in sorted(KML_DIR.glob("*.kml")):
+    for name, items in sources:
         stats["files"] += 1
         placemarks = []
-        min_lon = min_lat = 999.0
-        max_lon = max_lat = -999.0
-        for fields in iter_placemarks(path):
+        for fields in items:
+            if not fields.get("field_id"):
+                continue
             stats["placemarks"] += 1
             try:
                 lon = float(fields["centroid_lon"])
@@ -253,58 +282,39 @@ def collect(boxes: list[dict]) -> tuple[list[dict], dict]:
             except (KeyError, ValueError):
                 stats["rejected"] += 1
                 continue
-            min_lon = min(min_lon, lon)
-            min_lat = min(min_lat, lat)
-            max_lon = max(max_lon, lon)
-            max_lat = max(max_lat, lat)
             placemarks.append((fields, field_id, lon, lat, area))
-        names = overlapping_villages(boxes, min_lon, min_lat, max_lon, max_lat) if placemarks else []
-        needed.update(names)
-        files.append((path, placemarks, names))
-        print(f"read {path.name}: {len(placemarks)} placemarks, {len(names)} candidate villages", flush=True)
+        files.append((name, placemarks))
+        print(f"read {name}: {len(placemarks)} placemarks", flush=True)
 
-    print(f"loading polygons for {len(needed)} villages", flush=True)
-    cache = load_fields_for_villages(needed)
-    stats["villages_loaded"] = len(needed)
+    print("loading field identity", flush=True)
+    index = load_field_index()
+    print(f"identity keys {len(index)}", flush=True)
 
-    for path, placemarks, names in files:
-        if not placemarks:
-            print(f"{path.name}: no placemarks", flush=True)
-            continue
-        candidates = [field for name in names for field in cache.get(name, [])]
-        if not candidates:
-            stats["unmatched"] += len(placemarks)
-            print(f"{path.name}: no candidate fields", flush=True)
-            continue
-        tree = STRtree([field["geom"] for field in candidates])
+    for name, placemarks in files:
         matched = 0
         for fields, field_id, lon, lat, area in placemarks:
-            indexes = tree.query(Point(lon, lat), predicate="intersects")
-            hits = [candidates[int(index)] for index in indexes]
-            boundary = choose_hit(hits, field_id, area)
+            hits = []
+            for village in villages_at(boxes, lon, lat):
+                hits.extend(index.get((village, field_id), []))
+            unique = {hit["id"]: hit for hit in hits}
+            hits = list(unique.values())
+            if not hits:
+                stats["unmatched"] += 1
+                continue
+            boundary = nearest_hit(hits, lon, lat)
             if boundary is None:
-                if len(hits) > 1:
-                    stats["ambiguous"] += 1
-                else:
-                    stats["unmatched"] += 1
+                stats["ambiguous"] += 1
                 continue
             built = build_row(fields, boundary, area, identified_on)
             if built is None:
                 stats["rejected"] += 1
                 continue
-            key = (built["field_boundary_id"], built["season"])
-            previous = seen.get(key)
-            if previous is not None:
-                stats["duplicate_field"] += 1
-                if (built["confidence"] or 0) > (previous["confidence"] or 0):
-                    seen[key] = built
-                continue
-            seen[key] = built
+            remember(seen, stats, built)
             matched += 1
-        print(f"{path.name}: matched {matched} of {len(placemarks)}", flush=True)
-    rows = list(seen.values())
-    stats["ready"] = len(rows)
-    return rows, stats
+        print(f"{name}: matched {matched} of {len(placemarks)}", flush=True)
+
+    stats["ready"] = len(seen)
+    return list(seen.values()), stats
 
 
 def build_row(fields: dict[str, str], boundary: dict, area: float | None, identified_on: date) -> dict | None:
@@ -388,13 +398,20 @@ def write_rows(rows: list[dict]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--apply", action="store_true", help="Write rows. Without this, only report.")
+    parser.add_argument("--progress", type=Path, default=None, help="Read kabirdham_allcrops_progress.json instead of KML files.")
     args = parser.parse_args()
-    if not KML_DIR.is_dir():
-        raise SystemExit(f"Missing folder: {KML_DIR}")
+    if args.progress is not None:
+        if not args.progress.is_file():
+            raise SystemExit(f"Missing file: {args.progress}")
+        sources = progress_sources(args.progress)
+    else:
+        if not KML_DIR.is_dir():
+            raise SystemExit(f"Missing folder: {KML_DIR}")
+        sources = kml_sources()
     print("seasons before:", existing_season_counts(), flush=True)
     boxes = load_admin_boxes()
     print(f"admin villages {len(boxes)}", flush=True)
-    rows, stats = collect(boxes)
+    rows, stats = collect(boxes, sources)
     seasons: dict[str, int] = {}
     for row in rows:
         seasons[row["season"]] = seasons.get(row["season"], 0) + 1

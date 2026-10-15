@@ -25,7 +25,7 @@ from shapely.geometry import Polygon
 from sqlalchemy import bindparam, text
 from sqlalchemy.exc import OperationalError
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from app.database import engine  # noqa: E402

@@ -1,36 +1,31 @@
+// Legend colors for biomass chart + field map (Total, Arhar, Sugarcane, Mustard, Maize, Wheat, Rice).
+const BIOMASS_TOTAL_COLOR = "#176b66";
 const CROP_COLORS = {
-  Rice: "#facc15",
-  Sugarcane: "#22c55e",
-  Cotton: "#ef4444",
-  Wheat: "#f59e0b",
-  Maize: "#fb923c",
+  Rice: "#23bd67",
+  Sugarcane: "#f04c46",
+  "Arhar (Tur)": "#fad036",
+  Mustard: "#4f78e9",
+  Maize: "#a849f3",
+  Wheat: "#f78229",
+  Cotton: "#be123c",
   Soybean: "#a16207",
-  "Arhar (Tur)": "#9333ea",
-  Mustard: "#eab308",
-  "Linseed (Tisi)": "#4f46e5",
-  "Gram (Chana)": "#16a34a",
-  "Lentil (Masoor)": "#0d9488",
+  "Linseed (Tisi)": "#0d9488",
+  "Gram (Chana)": "#65a30d",
+  "Lentil (Masoor)": "#0891b2",
   "Fallow/Uncertain": "#9ca3af",
-  "Rice + Wheat": "#ca8a04",
-  "Rice + Mustard": "#fde047",
-  "Rice + Linseed (Tisi)": "#a3e635",
-  "Rice + Gram (Chana)": "#84cc16",
-  "Rice + Lentil (Masoor)": "#bef264",
-  "Arhar (Tur) + Mustard": "#c026d3",
-  "Arhar (Tur) + Wheat": "#7c3aed",
-  "Arhar (Tur) + Linseed (Tisi)": "#6366f1",
-  "Arhar (Tur) + Gram (Chana)": "#db2777",
-  "Arhar (Tur) + Lentil (Masoor)": "#f472b6",
-  "Maize + Wheat": "#ea580c",
-  "Maize + Linseed (Tisi)": "#0ea5e9",
-  "Maize + Mustard": "#f97316",
-  "Maize + Gram (Chana)": "#14b8a6",
-  "Maize + Lentil (Masoor)": "#06b6d4",
 };
+
+function cropBaseName(label) {
+  const text = String(label || "").trim();
+  if (!text) return "";
+  if (CROP_COLORS[text]) return text;
+  const first = text.split(" + ")[0].trim();
+  return CROP_COLORS[first] ? first : text;
+}
 
 const ALL_CROPS_CARD_LIMIT = 4;
 
-const HIDDEN_CROPS = new Set(["subpixel", "tree", "uncertain"]);
+const HIDDEN_CROPS = new Set(["subpixel", "tree", "uncertain", "fallow/uncertain", "unclassified"]);
 
 const MONTH_NAMES = [
   "January", "February", "March", "April", "May", "June",
@@ -85,6 +80,7 @@ const state = {
   cropVillage: "",
   cropYear: "",
   cropMonth: "",
+  cropSeason: "",
   cropPeriods: [],
   cropPlace: null,
   cropFieldCollection: null,
@@ -108,7 +104,10 @@ const state = {
   biomassByCropId: null,
   biomassRequest: 0,
   biomassPlaces: null,
-  biomassYears: ["2024", "2025"],
+  biomassYears: ["2023", "2024", "2025", "2026"],
+  biomassCompare: null,
+  biomassCompareVillage: "",
+  biomassCompareSeason: "",
   cropPage: 0,
   cropPageSize: 40,
   cropTotal: 0,
@@ -144,12 +143,25 @@ let analysisClipBound = false;
 let cropMapReady = false;
 
 function colorFor(label) {
-  if (CROP_COLORS[label]) return CROP_COLORS[label];
+  if (label === "Total") return BIOMASS_TOTAL_COLOR;
+  const base = cropBaseName(label);
+  if (CROP_COLORS[base]) return CROP_COLORS[base];
   const text = String(label || "");
   if (!text) return "#6c757d";
   let hash = 0;
   for (let index = 0; index < text.length; index += 1) hash = (hash * 31 + text.charCodeAt(index)) >>> 0;
   return `hsl(${hash % 360}, 65%, 50%)`;
+}
+
+function darkenHex(hex, amount = 0.28) {
+  const value = String(hex || "").replace("#", "");
+  if (value.length !== 6) return hex || "#374151";
+  const channel = (start) => {
+    const part = parseInt(value.slice(start, start + 2), 16);
+    return Math.max(0, Math.min(255, Math.round(part * (1 - amount))));
+  };
+  const toHex = (n) => n.toString(16).padStart(2, "0");
+  return `#${toHex(channel(0))}${toHex(channel(2))}${toHex(channel(4))}`;
 }
 
 function topCropNames(entries) {
@@ -1198,15 +1210,20 @@ async function startIndexStore() {
 function cropPeriodParams() {
   const params = new URLSearchParams();
   if (state.cropYear) params.set("year", state.cropYear);
-  if (state.cropMonth) params.set("month", state.cropMonth);
+  // Season replaces month for biomass; crop field loads stay year-scoped.
   return params;
 }
 
 function periodLabel() {
   const year = state.cropYear;
   if (!year) return "";
-  if (!state.cropMonth) return String(year);
-  return `${MONTH_NAMES[Number(state.cropMonth) - 1]} ${year}`;
+  if (state.cropSeason === "kharif") return `Kharif ${year}`;
+  if (state.cropSeason === "rabi") return `Rabi ${year}-${String(Number(year) + 1).slice(-2)}`;
+  return String(year);
+}
+
+function biomassSeasonQuery() {
+  return state.cropSeason ? `season=${encodeURIComponent(state.cropSeason)}` : "";
 }
 
 function fillMonthSelect() {
@@ -1260,9 +1277,14 @@ async function loadCrops() {
 
 async function changeCropPeriod() {
   state.cropYear = $("place-year").value;
-  state.cropMonth = $("place-month").value;
+  state.cropMonth = $("place-month") ? $("place-month").value : "";
+  state.cropSeason = $("place-season") ? $("place-season").value : "";
   state.fieldKey = "";
   state.cropFieldCollection = null;
+  state.biomassPlaces = null;
+  state.biomassCompare = null;
+  state.biomassCompareVillage = "";
+  state.biomassCompareSeason = "";
   await loadCropStats();
   const villages = kawardhaPlaces().map((place) => place.village_name);
   if (state.cropVillage !== ALL_VILLAGES && !villages.some((name) => samePlaceName(name, state.cropVillage))) {
@@ -1591,37 +1613,18 @@ function bindVillageBoundary(feature, polygon, selectedName, highlighted) {
 
 function fieldStyle(feature) {
   const label = (feature.properties || {}).final_label;
-  if (samePlaceName(label, "Rice")) {
-    return {
-      color: "#ca8a04",
-      weight: 1.4,
-      opacity: 1,
-      fill: true,
-      fillColor: "#facc15",
-      fillOpacity: 0.72,
-    };
+  if (!label || isHiddenCrop(label) || samePlaceName(label, "Fallow/Uncertain")) {
+    return { color: "#9ca3af", weight: 1.2, opacity: 0.9, fill: true, fillColor: "#d1d5db", fillOpacity: 0.35 };
   }
-  if (samePlaceName(label, "Sugarcane")) {
-    return {
-      color: "#166534",
-      weight: 1.4,
-      opacity: 1,
-      fill: true,
-      fillColor: "#22c55e",
-      fillOpacity: 0.72,
-    };
-  }
-  if (samePlaceName(label, "Cotton")) {
-    return {
-      color: "#991b1b",
-      weight: 1.4,
-      opacity: 1,
-      fill: true,
-      fillColor: "#ef4444",
-      fillOpacity: 0.72,
-    };
-  }
-  return { color: "#eab308", weight: 1.6, fill: false, fillOpacity: 0 };
+  const fill = colorFor(label);
+  return {
+    color: darkenHex(fill, 0.32),
+    weight: 1.4,
+    opacity: 1,
+    fill: true,
+    fillColor: fill,
+    fillOpacity: 0.72,
+  };
 }
 
 function drawMap(fit) {
@@ -2465,8 +2468,14 @@ function activateBiomass() {
 
 function biomassYear(place, year) {
   const bucket = place && place[String(year)];
-  const emptyCrop = { fields: 0, tonnes: 0, area_ha: 0 };
-  return bucket || { fields: 0, tonnes: 0, area_ha: 0, rice: emptyCrop, cotton: emptyCrop };
+  return bucket || { fields: 0, tonnes: 0, area_ha: 0, crops: {} };
+}
+
+function biomassCropEntries(bucket, limit) {
+  const crops = (bucket && bucket.crops) || {};
+  const entries = Object.entries(crops).filter(([, amount]) => (Number(amount.tonnes) || 0) > 0.0005);
+  entries.sort((a, b) => (Number(b[1].tonnes) || 0) - (Number(a[1].tonnes) || 0));
+  return limit ? entries.slice(0, limit) : entries;
 }
 
 function biomassRollupFrom(bucket) {
@@ -2480,46 +2489,70 @@ function biomassRollupFrom(bucket) {
   };
 }
 
+async function loadVillageCompare(villageName) {
+  if (!villageName || villageName === ALL_VILLAGES) {
+    state.biomassCompare = null;
+    state.biomassCompareVillage = "";
+    state.biomassCompareSeason = "";
+    return null;
+  }
+  const season = state.cropSeason || "";
+  if (
+    state.biomassCompare
+    && samePlaceName(state.biomassCompareVillage, villageName)
+    && state.biomassCompareSeason === season
+  ) {
+    return state.biomassCompare;
+  }
+  const seasonQuery = biomassSeasonQuery();
+  const url = `/biomass/compare?village=${encodeURIComponent(villageName)}${seasonQuery ? `&${seasonQuery}` : ""}`;
+  const body = await readJson(url);
+  state.biomassCompare = body;
+  state.biomassCompareVillage = villageName;
+  state.biomassCompareSeason = season;
+  if (Array.isArray(body.years) && body.years.length) {
+    state.biomassYears = body.years.map(String);
+  }
+  return body;
+}
+
 async function loadVillageBiomass() {
   const requestId = ++state.biomassRequest;
   const jobs = [];
   state.biomassByCropId = new Map();
+  const selectedName = state.cropVillage && state.cropVillage !== ALL_VILLAGES ? state.cropVillage : "";
+  const season = state.cropSeason || "";
+  if (!samePlaceName(state.biomassCompareVillage, selectedName) || state.biomassCompareSeason !== season) {
+    state.biomassCompare = null;
+    state.biomassCompareVillage = "";
+    state.biomassCompareSeason = "";
+  }
   if (state.biomassPlaces && requestId === state.biomassRequest) {
     renderVillageBiomass(null);
   }
   if (!state.biomassPlaces) {
-    jobs.push(readJson("/biomass/places").then((body) => {
+    const seasonQuery = biomassSeasonQuery();
+    const placesUrl = `/biomass/places${seasonQuery ? `?${seasonQuery}` : ""}`;
+    jobs.push(readJson(placesUrl).then((body) => {
       if (requestId !== state.biomassRequest) return;
       state.biomassPlaces = body.villages || [];
-      state.biomassYears = (body.years || ["2024", "2025"]).map(String);
+      state.biomassYears = (body.years || ["2023", "2024", "2025", "2026"]).map(String);
       renderVillageBiomass(null);
     }));
   }
+  if (selectedName) {
+    jobs.push(loadVillageCompare(selectedName).catch(() => null));
+  }
   await Promise.all(jobs);
   if (requestId !== state.biomassRequest || state.analysisKind !== "biomass") return;
-  const selected = selectedFieldLayer && selectedFieldLayer.feature && state.biomassByCropId
-    ? state.biomassByCropId.get(biomassCropId(selectedFieldLayer.feature))
-    : null;
-  renderVillageBiomass(selected || null);
+  renderVillageBiomass(null);
   showBanner("");
-  const index = state.biomassByCropId;
-  if (!index) return;
-  eachFieldPolygon((polygon) => {
-    const feature = polygon.feature || {};
-    const row = index.get(biomassCropId(feature));
-    if (!row) return;
-    const props = feature.properties || {};
-    const cropName = props.final_label ? `${props.final_label} · ` : "";
-    polygon.bindTooltip(
-      `${cropName}${formatNumber(props.area_ha, 3)} ha · ${biomassRangeText(row.total_tonnes)}`,
-      { sticky: true },
-    );
-  });
 }
 
 function biomassSourceText(source) {
   if (source === "scenes") return "Calculated from this village's Sentinel-2 scenes.";
   if (source === "village_average") return "This village had no scenes, so the rate is the average of villages that did.";
+  if (source === "mixed") return "One season used this village's scenes. The other used the average of villages with scenes.";
   return "";
 }
 
@@ -2604,18 +2637,22 @@ function biomassVillageList(places, selectedName, years) {
   return wrap;
 }
 
-function biomassStat(label, bucket, deltaText) {
+function biomassStat(label, bucket, deltaText, rateText) {
   const card = document.createElement("div");
   card.className = "biomass-stat";
   const title = document.createElement("span");
   title.textContent = label;
-  const rice = bucket.rice || {};
-  const cotton = bucket.cotton || {};
-  const crops = document.createElement("small");
-  crops.textContent = `Rice ${biomassRangeText(rice.tonnes)}`;
-  const cottonLine = document.createElement("small");
-  cottonLine.textContent = `Cotton ${biomassRangeText(cotton.tonnes)}`;
-  card.append(title, biomassRangeEnds(biomassRollupFrom(bucket).tonnes), crops, cottonLine);
+  card.append(title, biomassRangeEnds(biomassRollupFrom(bucket).tonnes));
+  if (rateText) {
+    const rate = document.createElement("small");
+    rate.textContent = rateText;
+    card.append(rate);
+  }
+  biomassCropEntries(bucket, BIOMASS_STAT_CROPS).forEach(([crop, amount]) => {
+    const line = document.createElement("small");
+    line.textContent = `${crop} ${biomassRangeText(amount.tonnes)}`;
+    card.append(line);
+  });
   if (deltaText) {
     const delta = document.createElement("small");
     if (deltaText.startsWith("+")) delta.className = "is-up";
@@ -2624,6 +2661,53 @@ function biomassStat(label, bucket, deltaText) {
     card.append(delta);
   }
   return card;
+}
+
+function biomassCompareDelta(amount, previousYear) {
+  if (amount == null || amount.change_pct == null || !amount.fields) return "";
+  const pct = Number(amount.change_pct);
+  const sign = pct > 0 ? "+" : "";
+  return `${sign}${formatNumber(pct, 0)}% vs ${previousYear}`;
+}
+
+function biomassBucketFromCompare(amount) {
+  const crops = {};
+  return {
+    fields: Number(amount && amount.fields) || 0,
+    tonnes: Number(amount && amount.tonnes) || 0,
+    area_ha: Number(amount && amount.area_ha) || 0,
+    min_biomass: Number(amount && amount.min_biomass) || 0,
+    max_biomass: Number(amount && amount.max_biomass) || 0,
+    crops,
+  };
+}
+
+function biomassYearCardsFromCompare(compare) {
+  const row = document.createElement("div");
+  row.className = "biomass-pair";
+  const years = (compare.years || []).map(String);
+  const totals = compare.totals || [];
+  const byYear = new Map(totals.map((item) => [String(item.year), item]));
+  const cropByYear = {};
+  (compare.crops || []).forEach((entry) => {
+    (entry.years || []).forEach((amount) => {
+      const key = String(amount.year);
+      if (!cropByYear[key]) cropByYear[key] = {};
+      if (Number(amount.tonnes) > 0) cropByYear[key][entry.crop] = { tonnes: amount.tonnes };
+    });
+  });
+  years.forEach((year, index) => {
+    const amount = byYear.get(year) || { year, fields: 0, tonnes: 0, area_ha: 0 };
+    const bucket = biomassBucketFromCompare(amount);
+    bucket.crops = cropByYear[year] || {};
+    const previous = index > 0 ? years[index - 1] : null;
+    const delta = previous ? biomassCompareDelta(amount, previous) : "";
+    const rate = amount.biomass_t_ha != null
+      ? `${formatNumber(amount.biomass_t_ha, 1)} t/ha · ${formatNumber(amount.fields)} fields`
+      : `${formatNumber(amount.fields)} fields`;
+    row.append(biomassStat(year, bucket, delta, rate));
+  });
+  return row;
 }
 
 function biomassChartFonts() {
@@ -2644,11 +2728,28 @@ function biomassChartFonts() {
   };
 }
 
-const BIOMASS_SERIES = [
-  ["Total", null, "#0f766e"],
-  ["Rice", "rice", "#facc15"],
-  ["Cotton", "cotton", "#ef4444"],
-];
+const BIOMASS_STAT_CROPS = 4;
+const BIOMASS_CHART_CROPS = 6;
+const BIOMASS_LEGEND_ORDER = ["Arhar (Tur)", "Sugarcane", "Mustard", "Maize", "Wheat", "Rice"];
+
+function biomassSeries(place, years) {
+  const totals = new Map();
+  years.forEach((year) => {
+    biomassCropEntries(biomassYear(place, year)).forEach(([crop, amount]) => {
+      totals.set(crop, (totals.get(crop) || 0) + (Number(amount.tonnes) || 0));
+    });
+  });
+  const ranked = [...totals.entries()].sort((a, b) => b[1] - a[1]);
+  const preferred = BIOMASS_LEGEND_ORDER
+    .filter((crop) => totals.has(crop))
+    .map((crop) => [crop, totals.get(crop)]);
+  const rest = ranked.filter(([crop]) => !BIOMASS_LEGEND_ORDER.includes(crop));
+  const crops = [...preferred, ...rest].slice(0, BIOMASS_CHART_CROPS);
+  return [
+    ["Total", null, BIOMASS_TOTAL_COLOR],
+    ...crops.map(([crop]) => [crop, crop, colorFor(crop)]),
+  ];
+}
 
 function biomassBucketBand(bucket) {
   const low = Number(bucket && bucket.min_biomass);
@@ -2663,12 +2764,12 @@ function drawVillageYearly(place, years) {
   if (typeof Chart === "undefined" || !place) return;
   const bar = $("biomass-bars");
   if (!bar) return;
-  const datasets = BIOMASS_SERIES
+  const datasets = biomassSeries(place, years)
     .map(([label, key, color]) => ({
       label,
       data: years.map((year) => {
         const bucket = biomassYear(place, year);
-        return biomassBucketBand(key ? bucket[key] : bucket);
+        return biomassBucketBand(key ? (bucket.crops || {})[key] : bucket);
       }),
       backgroundColor: color,
       borderRadius: 6,
@@ -2713,10 +2814,12 @@ function biomassTotals(places, year) {
     sum.fields += bucket.fields || 0;
     sum.area_ha += Number(bucket.area_ha) || 0;
     sum.tonnes += Number(bucket.tonnes) || 0;
-    sum.rice.tonnes += Number((bucket.rice || {}).tonnes) || 0;
-    sum.cotton.tonnes += Number((bucket.cotton || {}).tonnes) || 0;
+    biomassCropEntries(bucket).forEach(([crop, amount]) => {
+      const total = sum.crops[crop] || (sum.crops[crop] = { tonnes: 0 });
+      total.tonnes += Number(amount.tonnes) || 0;
+    });
     return sum;
-  }, { fields: 0, area_ha: 0, tonnes: 0, rice: { tonnes: 0 }, cotton: { tonnes: 0 } });
+  }, { fields: 0, area_ha: 0, tonnes: 0, crops: {} });
 }
 
 function biomassChangeText(before, after, beforeYear) {
@@ -2734,7 +2837,11 @@ function biomassYearCards(yearBuckets) {
   yearBuckets.forEach(([year, bucket], index) => {
     const previous = index > 0 ? yearBuckets[index - 1] : null;
     const delta = previous ? biomassChangeText(previous[1].tonnes, bucket.tonnes, previous[0]) : "";
-    row.append(biomassStat(year, bucket, delta));
+    const rollup = biomassRollupFrom(bucket);
+    const rate = rollup.area
+      ? `${formatNumber(rollup.rate, 1)} t/ha · ${formatNumber(rollup.fields)} fields`
+      : `${formatNumber(rollup.fields)} fields`;
+    row.append(biomassStat(year, bucket, delta, rate));
   });
   return row;
 }
@@ -2758,22 +2865,25 @@ function renderVillageBiomass(fieldRow) {
   const selectedName = state.cropVillage && state.cropVillage !== ALL_VILLAGES ? state.cropVillage : "";
   const selected = places.find((place) => samePlaceName(place.village, selectedName)) || null;
   const years = state.biomassYears || ["2024", "2025"];
+  const compare = state.biomassCompare && samePlaceName(state.biomassCompareVillage, selectedName)
+    ? state.biomassCompare
+    : null;
   const card = document.createElement("div");
   card.className = "biomass-card";
   const bandNote = document.createElement("p");
   bandNote.className = "biomass-note";
-  bandNote.textContent = "Min is 15% below the estimate. Max is 15% above it.";
+  bandNote.textContent = "Compare whole villages year by year. Fields are not matched across years. Min/Max is ±15%.";
   card.append(bandNote);
   if (selected) {
     const heading = document.createElement("p");
     heading.className = "biomass-kicker";
-    heading.textContent = `${selected.village} · whole village by year`;
+    heading.textContent = `${selected.village} · village total by year`;
     const chartNote = document.createElement("p");
     chartNote.className = "biomass-note";
-    chartNote.textContent = "Every stored field in the village, summed per year.";
+    chartNote.textContent = "Village biomass each year (all crops summed). Use t/ha when field counts differ.";
     card.append(
       heading,
-      biomassYearCards(years.map((year) => [year, biomassYear(selected, year)])),
+      compare ? biomassYearCardsFromCompare(compare) : biomassYearCards(years.map((year) => [year, biomassYear(selected, year)])),
       chartNote,
       biomassFrame("biomass-chart biomass-chart-bars", "biomass-bars"),
     );
@@ -2782,7 +2892,7 @@ function renderVillageBiomass(fieldRow) {
     const field = document.createElement("div");
     field.className = "biomass-field";
     const caption = document.createElement("span");
-    caption.textContent = `This ${fieldRow.crop} field · ${fieldRow.year} · ${formatNumber(fieldRow.area_ha, 3)} ha`;
+    caption.textContent = `Selected field only (not used for year compare) · ${fieldRow.crop} · ${fieldRow.year} · ${formatNumber(fieldRow.area_ha, 3)} ha`;
     field.append(caption, biomassRangeEnds(fieldRow.total_tonnes));
     card.append(field);
   }
@@ -2804,8 +2914,8 @@ function renderVillageBiomass(fieldRow) {
   if (active) active.scrollIntoView({ block: "nearest" });
   if (selected) drawVillageYearly(selected, years);
   if (fieldRow) setStoreStatus(biomassSourceText(fieldRow.rate_source));
-  else if (!selected) setStoreStatus("Choose a village to compare its biomass year by year.");
-  else setStoreStatus(`Village biomass for ${years.join(", ")}.`);
+  else if (!selected) setStoreStatus("Choose a village to compare biomass year by year.");
+  else setStoreStatus(`${selected.village}: village totals for ${years.join(", ")}.`);
 }
 
 function renderFieldBiomass(row) {
@@ -2822,28 +2932,32 @@ async function showFieldBiomass(feature, polygon) {
   polygon.bringToFront();
   const props = (feature && feature.properties) || {};
   const fieldId = Number(props.field_id);
-  const cropId = biomassCropId(feature);
-  let row = cropId && state.biomassByCropId ? state.biomassByCropId.get(cropId) : null;
-  if (!row && Number.isFinite(fieldId)) {
+  let row = null;
+  if (Number.isFinite(fieldId)) {
     const params = new URLSearchParams({ field_id: String(fieldId) });
     const village = props.village_name || selectedPlace().village;
     if (village && village !== ALL_VILLAGES) params.set("village", village);
     const year = Number(state.cropYear);
-    if (year === 2024 || year === 2025) params.set("year", String(year));
+    if ((state.biomassYears || []).includes(String(year))) params.set("year", String(year));
     if (props.final_label) params.set("crop", props.final_label);
-    const body = await readJson(`/biomass/field?${params.toString()}`);
-    row = body && Array.isArray(body.fields) ? body.fields[0] : body;
+    try {
+      const body = await readJson(`/biomass/field?${params.toString()}`);
+      row = body && Array.isArray(body.fields) ? body.fields[0] : body;
+    } catch (_error) {
+      row = null;
+    }
   }
   if (!state.biomassPlaces) await loadVillageBiomass();
   if (state.analysisKind !== "biomass") return;
   if (!row) {
-    setStoreStatus("No biomass stored for this field.");
+    setStoreStatus("No biomass for this field. Village year compare still uses village totals.");
+    renderVillageBiomass(null);
     return;
   }
   renderFieldBiomass(row);
   const band = biomassBand(row.total_tonnes);
   polygon.bindPopup(
-    `<strong>${row.crop}</strong><br>${formatNumber(row.area_ha, 3)} ha<br>Min ${formatNumber(band.min, band.digits)} t<br>Max ${formatNumber(band.max, band.digits)} t`,
+    `<strong>${row.crop}</strong><br>${formatNumber(row.area_ha, 3)} ha<br>Min ${formatNumber(band.min, band.digits)} t<br>Max ${formatNumber(band.max, band.digits)} t<br><em>Year compare uses the whole village, not this field.</em>`,
   ).openPopup();
 }
 
@@ -3041,9 +3155,19 @@ async function boot() {
     fillMonthSelect();
     changeCropPeriod().catch((error) => showBanner(error.message));
   });
-  $("place-month").addEventListener("change", () => {
-    changeCropPeriod().catch((error) => showBanner(error.message));
-  });
+  if ($("place-season")) {
+    $("place-season").addEventListener("change", () => {
+      changeCropPeriod().catch((error) => showBanner(error.message));
+      if (state.analysisKind === "biomass") {
+        loadVillageBiomass().catch((error) => showBanner(error.message));
+      }
+    });
+  }
+  if ($("place-month")) {
+    $("place-month").addEventListener("change", () => {
+      changeCropPeriod().catch((error) => showBanner(error.message));
+    });
+  }
   $("layer-villages").addEventListener("change", () => {
     syncLayerFlags();
     drawMap(false);

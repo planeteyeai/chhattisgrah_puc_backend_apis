@@ -4,6 +4,19 @@ FastAPI service and dashboard for Kabirdham (Kawardha) cadastral records and cro
 
 Open the dashboard at `http://127.0.0.1:8000/` after the server starts. API docs stay at `http://127.0.0.1:8000/docs`.
 
+## Project layout
+
+| Path | Purpose |
+| --- | --- |
+| `app/` | FastAPI application (deployed) |
+| `frontend/` | Dashboard static files (deployed) |
+| `scripts/` | One-off DB copy / migrate helpers |
+| `pipelines/crop_identification/` | Offline crop classification into MySQL |
+| `docs/` | Extra API notes for the frontend |
+| `data/` | Local KML dumps (gitignored; not deployed) |
+
+Docker / Railway only copy `app/` and `frontend/`.
+
 ## Data sources
 
 | Store | Environment variable | Tables | Used by |

@@ -21,7 +21,19 @@ build/
 *credentials*.json
 service-account*.json
 *-service-account.json
-identification_progress.json
-all_crops_villages/
+
+# Offline pipeline artefacts (models, progress, local KML dumps)
+data/
 *.joblib
-all_crops_villages
+*.kml
+identification_progress.json
+identification_db.lock
+pipelines/crop_identification/kabirdham_progress_*.json
+pipelines/crop_identification/kabirdham_results_*.json
+pipelines/crop_identification/kabirdham_dashboard_*.html
+pipelines/crop_identification/kabirdham_summary_*.csv
+pipelines/crop_identification/kabirdham_fields_*.csv
+pipelines/crop_identification/kml_extracted/
+pipelines/crop_identification/kmls_by_village/
+pipelines/crop_identification/kmls_by_crop/
+pipelines/crop_identification/*.zip
