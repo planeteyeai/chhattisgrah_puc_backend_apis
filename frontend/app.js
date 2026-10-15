@@ -27,6 +27,14 @@ const ALL_CROPS_CARD_LIMIT = 4;
 
 const HIDDEN_CROPS = new Set(["subpixel", "tree", "uncertain", "fallow/uncertain", "unclassified"]);
 
+// Chhattisgarh crop calendar — must match backend CALENDAR_SEASON in app/biomass.py
+const KHARIF_CROPS = new Set([
+  "Rice", "Maize", "Soybean", "Cotton", "Arhar (Tur)", "Sugarcane",
+]);
+const RABI_CROPS = new Set([
+  "Wheat", "Mustard", "Linseed (Tisi)", "Gram (Chana)", "Lentil (Masoor)",
+]);
+
 const MONTH_NAMES = [
   "January", "February", "March", "April", "May", "June",
   "July", "August", "September", "October", "November", "December",
@@ -166,7 +174,7 @@ function darkenHex(hex, amount = 0.28) {
 
 function topCropNames(entries) {
   return entries
-    .filter(([label]) => !isHiddenCrop(label))
+    .filter(([label]) => !isHiddenCrop(label) && labelInSeason(label))
     .sort((left, right) => right[1] - left[1])
     .slice(0, ALL_CROPS_CARD_LIMIT)
     .map(([label]) => label);
@@ -178,6 +186,45 @@ function isHiddenCrop(label) {
 
 function showsAllCrops() {
   return state.selectedCrop === ALL_CROPS;
+}
+
+function seasonCropSet(season = state.cropSeason) {
+  if (season === "kharif") return KHARIF_CROPS;
+  if (season === "rabi") return RABI_CROPS;
+  return null;
+}
+
+function labelCropParts(label) {
+  return String(label || "")
+    .split(" + ")
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function labelHasCrop(label, crop) {
+  if (!crop) return false;
+  if (samePlaceName(label, crop)) return true;
+  return labelCropParts(label).some((part) => samePlaceName(part, crop));
+}
+
+function labelInSeason(label, season = state.cropSeason) {
+  const allowed = seasonCropSet(season);
+  if (!allowed) return !isHiddenCrop(label);
+  return labelCropParts(label).some((part) => {
+    if (isHiddenCrop(part)) return false;
+    return [...allowed].some((crop) => samePlaceName(part, crop));
+  });
+}
+
+function cropInSeason(crop, season = state.cropSeason) {
+  const allowed = seasonCropSet(season);
+  if (!allowed) return !isHiddenCrop(crop);
+  if (isHiddenCrop(crop)) return false;
+  if ([...allowed].some((name) => samePlaceName(name, crop))) return true;
+  // Double-crop labels (e.g. "Rice + Wheat") count if any part is in season.
+  return labelCropParts(crop).some((part) =>
+    [...allowed].some((name) => samePlaceName(part, name))
+  );
 }
 
 function formatNumber(value, digits = 0) {
@@ -1210,7 +1257,7 @@ async function startIndexStore() {
 function cropPeriodParams() {
   const params = new URLSearchParams();
   if (state.cropYear) params.set("year", state.cropYear);
-  // Season replaces month for biomass; crop field loads stay year-scoped.
+  if (state.cropSeason) params.set("season", state.cropSeason);
   return params;
 }
 
@@ -1279,6 +1326,10 @@ async function changeCropPeriod() {
   state.cropYear = $("place-year").value;
   state.cropMonth = $("place-month") ? $("place-month").value : "";
   state.cropSeason = $("place-season") ? $("place-season").value : "";
+  // Drop crop chip if it is not part of the newly selected season.
+  if (state.selectedCrop && !showsAllCrops() && !cropInSeason(state.selectedCrop)) {
+    state.selectedCrop = ALL_CROPS;
+  }
   state.fieldKey = "";
   state.cropFieldCollection = null;
   state.biomassPlaces = null;
@@ -1293,6 +1344,9 @@ async function changeCropPeriod() {
   syncHierarchySelects();
   renderCropSummary();
   await applyPlaceSelection();
+  if (state.analysisKind === "biomass") {
+    loadVillageBiomass().catch((error) => showBanner(error.message));
+  }
 }
 
 function cropLabelStats(labels, cropName) {
@@ -1332,7 +1386,7 @@ function kawardhaPlaces() {
 function labelBars(rows) {
   const wrap = document.createElement("div");
   wrap.className = "mix-list";
-  const visible = rows.filter(([label]) => !isHiddenCrop(label));
+  const visible = rows.filter(([label]) => !isHiddenCrop(label) && (showsAllCrops() ? labelInSeason(label) : cropInSeason(label) || labelInSeason(label)));
   const max = Math.max(...visible.map(([, count]) => count), 1);
   visible.forEach(([label, count, areaHa]) => {
     const row = document.createElement("div");
@@ -1484,15 +1538,22 @@ function renderCropLegend() {
   allButton.textContent = "All crops";
   allButton.addEventListener("click", () => selectCrop(ALL_CROPS));
   legend.append(allButton);
-  summary.labels.filter((item) => !isHiddenCrop(item.label)).forEach((item) => {
+  // Legend chips are single crops from the calendar for the selected season.
+  const seasonCrops = seasonCropSet();
+  const legendLabels = seasonCrops
+    ? [...seasonCrops].filter((name) => summary.labels.some((item) => labelHasCrop(item.label, name)))
+    : summary.labels
+      .map((item) => item.label)
+      .filter((label) => !isHiddenCrop(label) && !String(label).includes(" + "));
+  legendLabels.forEach((label) => {
     const button = document.createElement("button");
     button.type = "button";
-    button.className = samePlaceName(state.selectedCrop, item.label) ? "is-active" : "";
+    button.className = samePlaceName(state.selectedCrop, label) ? "is-active" : "";
     const swatch = document.createElement("i");
     swatch.className = "swatch";
-    swatch.style.background = colorFor(item.label);
-    button.append(swatch, document.createTextNode(item.label));
-    button.addEventListener("click", () => selectCrop(item.label));
+    swatch.style.background = colorFor(label);
+    button.append(swatch, document.createTextNode(label));
+    button.addEventListener("click", () => selectCrop(label));
     legend.append(button);
   });
 }
@@ -1505,7 +1566,7 @@ function selectCrop(label) {
   renderCropLegend();
   renderCropSummary();
   const place = selectedPlace();
-  const fieldKey = `${place.district}|${place.subdistrict}|${place.village}|${state.cropYear}|${state.cropMonth}`;
+  const fieldKey = `${place.district}|${place.subdistrict}|${place.village}|${state.cropYear}|${state.cropSeason || "all"}`;
   const needFields = Boolean(state.selectedCrop)
     && place.village
     && place.village !== ALL_VILLAGES
@@ -1564,9 +1625,9 @@ function visibleFieldFeatures() {
   if (!state.selectedCrop || isHiddenCrop(state.selectedCrop)) return [];
   return features.filter((feature) => {
     const label = (feature.properties || {}).final_label;
-    if (!label || isHiddenCrop(label)) return false;
+    if (!label || isHiddenCrop(label) || !labelInSeason(label)) return false;
     if (showsAllCrops()) return true;
-    return samePlaceName(label, state.selectedCrop);
+    return labelHasCrop(label, state.selectedCrop) && cropInSeason(state.selectedCrop);
   });
 }
 
@@ -1809,7 +1870,7 @@ async function applyPlaceSelection() {
       }
       if (requestId !== state.placeRequest) return;
       if (state.outlineKey === outlineKey) drawMap(true);
-      const fieldKey = `${outlineKey}|${place.village}|${state.cropYear}|${state.cropMonth}`;
+      const fieldKey = `${outlineKey}|${place.village}|${state.cropYear}|${state.cropSeason || "all"}`;
       if (place.village && place.village !== ALL_VILLAGES && state.selectedCrop && state.fieldKey !== fieldKey) {
         note.textContent = "Loading field boundaries…";
         const params = new URLSearchParams({
@@ -3158,9 +3219,6 @@ async function boot() {
   if ($("place-season")) {
     $("place-season").addEventListener("change", () => {
       changeCropPeriod().catch((error) => showBanner(error.message));
-      if (state.analysisKind === "biomass") {
-        loadVillageBiomass().catch((error) => showBanner(error.message));
-      }
     });
   }
   if ($("place-month")) {

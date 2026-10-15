@@ -35,6 +35,7 @@ from typing import Any, NamedTuple
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import text
 
+from app.crop_calendar import CALENDAR_SEASON, parse_calendar_season
 from app.database import engine
 
 
@@ -57,23 +58,6 @@ CROP_PROFILES: dict[str, CropProfile] = {
     "Gram (Chana)": CropProfile("rabi", 1.5, True),
     "Lentil (Masoor)": CropProfile("rabi", 1.3, True),
 }
-
-# Chhattisgarh crop calendar: which season a crop belongs to in API responses.
-# Computation still uses each crop's window (kharif / arhar / rabi / annual).
-CALENDAR_SEASON: dict[str, str] = {
-    "Rice": "kharif",
-    "Maize": "kharif",
-    "Soybean": "kharif",
-    "Cotton": "kharif",
-    "Arhar (Tur)": "kharif",
-    "Sugarcane": "kharif",
-    "Wheat": "rabi",
-    "Mustard": "rabi",
-    "Linseed (Tisi)": "rabi",
-    "Gram (Chana)": "rabi",
-    "Lentil (Masoor)": "rabi",
-}
-VALID_SEASONS = frozenset({"kharif", "rabi"})
 # Daily PAR (MJ/m2/day) for Kabirdham, about 48% of global radiation at 22 N.
 PAR_MJ = {1: 8.2, 2: 9.4, 3: 10.6, 4: 11.5, 5: 12.0, 6: 10.1, 7: 7.9, 8: 7.7, 9: 8.4, 10: 8.9, 11: 8.4, 12: 7.9}
 STRESS = 1.0
@@ -106,14 +90,7 @@ def _clear_biomass_cache() -> None:
 
 def parse_season(value: str | None) -> str | None:
     """Normalize to `kharif` / `rabi`, or None when both seasons are wanted."""
-    if value is None or not str(value).strip():
-        return None
-    season = str(value).strip().lower()
-    if season in ("all", "both", "*"):
-        return None
-    if season not in VALID_SEASONS:
-        raise HTTPException(status_code=400, detail="season must be kharif or rabi")
-    return season
+    return parse_calendar_season(value)
 
 
 def parse_seasons(values: list[str] | tuple[str, ...] | None) -> tuple[str, ...] | None:
@@ -853,7 +830,12 @@ def biomass_village(
         item = dict(row)
         for key in ("area_ha", "biomass_t_ha", "total_tonnes", "min_biomass", "max_biomass", "kharif_tonnes", "rabi_tonnes"):
             item[key] = _float(item[key])
-        fields.append(item)
+        viewed = _season_field_view(item, season)
+        if season == "kharif" and not item.get("kharif_crop"):
+            continue
+        if season == "rabi" and not item.get("rabi_crop"):
+            continue
+        fields.append(viewed)
     total = int(totals["fields"] or 0)
     tonnes = round(float(totals["total_tonnes"] or 0), 4)
     low, high = biomass_bounds(tonnes)
@@ -1120,18 +1102,61 @@ FIELD_COLUMNS = """
 """
 
 
+def _season_field_view(item: dict[str, Any], season: str | None) -> dict[str, Any]:
+    """Expose one calendar season's crop name and tonnes on a biomass row (no double labels)."""
+    if season == "kharif":
+        crop = item.get("kharif_crop")
+        tonnes = float(item.get("kharif_tonnes") or 0)
+        if not crop:
+            return item
+        low, high = biomass_bounds(tonnes)
+        area = float(item.get("area_ha") or 0)
+        return {
+            **item,
+            "season": "kharif",
+            "crop": crop,
+            "total_tonnes": tonnes,
+            "biomass_t_ha": round(tonnes / area, 6) if area else item.get("biomass_t_ha"),
+            "min_biomass": low,
+            "max_biomass": high,
+        }
+    if season == "rabi":
+        crop = item.get("rabi_crop")
+        tonnes = float(item.get("rabi_tonnes") or 0)
+        if not crop:
+            return item
+        low, high = biomass_bounds(tonnes)
+        area = float(item.get("area_ha") or 0)
+        return {
+            **item,
+            "season": "rabi",
+            "crop": crop,
+            "total_tonnes": tonnes,
+            "biomass_t_ha": round(tonnes / area, 6) if area else item.get("biomass_t_ha"),
+            "min_biomass": low,
+            "max_biomass": high,
+        }
+    return item
+
+
 @router.get("/field")
 def biomass_field(
     field_id: int | None = Query(default=None),
     village: str | None = None,
     year: int | None = Query(default=None, ge=1900, le=2100),
+    season: str | None = Query(default=None),
     crop: str | None = None,
     crop_id: int | None = Query(default=None, ge=1),
 ) -> dict[str, Any]:
-    """Biomass for one plot. Pass field_id. Add village and year when that number exists in more than one place."""
+    """Biomass for one plot. Pass field_id. Add village, year, and season when needed.
+
+    With `season=kharif` or `season=rabi`, `crop` is the season crop only (never `Rice + Wheat`)
+    and tonnes / min / max are that season's part.
+    """
     if field_id is None and crop_id is None:
         raise HTTPException(status_code=400, detail="field_id is required")
     ensure_biomass_schema()
+    season = parse_season(season)
     clauses = []
     params: dict[str, Any] = {}
     if field_id is not None:
@@ -1146,6 +1171,10 @@ def biomass_field(
     if year is not None:
         clauses.append("`year` = :year")
         params["year"] = year
+    if season == "kharif":
+        clauses.append("kharif_crop IS NOT NULL")
+    elif season == "rabi":
+        clauses.append("rabi_crop IS NOT NULL")
     if crop:
         clauses.append("(LOWER(crop) = LOWER(:crop) OR LOWER(kharif_crop) = LOWER(:crop) OR LOWER(rabi_crop) = LOWER(:crop))")
         params["crop"] = crop.strip()
@@ -1163,10 +1192,10 @@ def biomass_field(
         ).mappings().all()
     if not rows:
         raise HTTPException(status_code=404, detail="No biomass stored for this field.")
-    fields = [_biomass_item(row) for row in rows]
+    fields = [_season_field_view(_biomass_item(row), season) for row in rows]
     if len(fields) == 1:
         return fields[0]
-    return {"field_id": field_id, "count": len(fields), "fields": fields}
+    return {"field_id": field_id, "season": season, "count": len(fields), "fields": fields}
 
 
 @router.get("/fields")
@@ -1202,7 +1231,7 @@ def biomass_fields(
             ),
             {**params, "limit": limit, "skip": skip},
         ).mappings().all()
-    fields = [_biomass_item(row) for row in rows]
+    fields = [_season_field_view(_biomass_item(row), season) for row in rows]
     return {**_page_meta(total, skip, limit, len(fields)), "season": season, "fields": fields}
 
 

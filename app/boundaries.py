@@ -9,6 +9,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
+from app.crop_calendar import (
+    calendar_label_sql,
+    parse_calendar_season,
+    season_display_label_sql,
+)
 from app.database import engine
 from app.geojson import json_safe
 
@@ -34,6 +39,7 @@ class BoundaryRequest(BaseModel):
     village_name: str | None = Field(None, examples=["Chhattisgarh"])
     year: int | None = Field(None, ge=1900, le=2100)
     month: int | None = Field(None, ge=1, le=12)
+    season: str | None = Field(None, examples=["kharif", "rabi"])
 
 
 class NameRequest(BaseModel):
@@ -594,10 +600,14 @@ def stream_crop_period_fields(
     village_name: str,
     year: int,
     month: int | None,
+    season: str | None = None,
 ) -> StreamingResponse:
     window = observation_window(year, month)
     assert window is not None
     start, end = window
+    season = parse_calendar_season(season)
+    season_sql = calendar_label_sql(season, "c.final_label")
+    label_sql = season_display_label_sql(season, "c.final_label")
     params: dict[str, Any] = {
         "district": district_name,
         "subdistrict": subdistrict_name,
@@ -608,7 +618,7 @@ def stream_crop_period_fields(
     statement = text(
         f"""
         SELECT c.id, c.field_boundary_id, c.field_id, c.village_name, c.subdistrict_name, c.district_name,
-               c.area_ha, c.final_label, c.predicted_crop, c.is_rice,
+               c.area_ha, {label_sql} AS final_label, c.predicted_crop, c.is_rice,
                COALESCE(f.geom_geojson, c.geom_geojson) AS geom_geojson
         FROM crop_identification c
         LEFT JOIN field_boundaries f ON f.id = c.field_boundary_id AND c.field_boundary_id > 0
@@ -618,6 +628,7 @@ def stream_crop_period_fields(
           AND c.observation_date >= :period_from
           AND c.observation_date < :period_to
           AND {IDENTIFIED_CROP_SQL}
+          AND {season_sql}
           AND (f.id IS NULL OR {CROPLAND_CLASS_SQL})
         ORDER BY c.field_id, c.id
         """
@@ -630,6 +641,7 @@ def stream_crop_period_fields(
         "village_name": village_name,
         "year": year,
         "month": month,
+        "season": season,
     }
     return StreamingResponse(iter_crop_features(statement, params, header), media_type="application/geo+json")
 
@@ -656,6 +668,7 @@ def iter_crop_features(statement, params: dict[str, Any], header: dict[str, Any]
                 "is_rice": bool(row.is_rice) if row.is_rice is not None else False,
                 "year": header.get("year"),
                 "month": header.get("month"),
+                "season": header.get("season"),
             }
             piece = '{"type":"Feature","id":' + str(int(row.id)) + ',"geometry":' + geometry
             piece += ',"properties":' + json.dumps(properties, ensure_ascii=False) + "}"
@@ -672,6 +685,7 @@ def stream_named_village_fields(
     village_name: str,
     year: int | None = None,
     month: int | None = None,
+    season: str | None = None,
 ) -> StreamingResponse:
     places = stored_subdistricts(district_name)
     block = next((row for row in places if same_name(row["subdistrict_name"], subdistrict_name)), None)
@@ -692,6 +706,7 @@ def stream_named_village_fields(
             stored_village,
             year,
             month,
+            season,
         )
     if match is None and admin_match is None:
         raise HTTPException(
@@ -702,10 +717,14 @@ def stream_named_village_fields(
             ),
         )
     stored_village = match["village_name"] if match else admin_match["village_name"]
+    season = parse_calendar_season(season)
+    season_sql = calendar_label_sql(season, "c.final_label")
+    label_sql = season_display_label_sql(season, "c.final_label")
     statement = text(
         f"""
         SELECT f.id, f.field_id, f.village_id, f.village_name, f.sub_dist, f.district,
-               f.area_ha, f.`class`, f.geom_geojson, c.final_label, c.predicted_crop, c.is_rice
+               f.area_ha, f.`class`, f.geom_geojson, {label_sql} AS final_label,
+               c.predicted_crop, c.is_rice
         FROM field_boundaries f
         INNER JOIN crop_identification c ON c.field_boundary_id = f.id
         WHERE f.district = :district
@@ -713,6 +732,7 @@ def stream_named_village_fields(
           AND f.village_name = :village_name
           AND {CROPLAND_CLASS_SQL}
           AND {IDENTIFIED_CROP_SQL}
+          AND {season_sql}
         ORDER BY f.field_id, f.id
         """
     )
@@ -734,6 +754,7 @@ def stream_named_village_fields(
                       AND f.village_name = :village_name
                       AND {CROPLAND_CLASS_SQL}
                       AND {IDENTIFIED_CROP_SQL}
+                      AND {season_sql}
                     """
                 ),
                 params,
@@ -746,6 +767,7 @@ def stream_named_village_fields(
         "district_name": block["district_name"],
         "subdistrict_name": block["subdistrict_name"],
         "village_name": stored_village,
+        "season": season,
         "count": field_count,
     }
     return StreamingResponse(iter_features(statement, params, header), media_type="application/geo+json")
@@ -788,11 +810,14 @@ def boundary_response(
     village_name: str | None,
     year: int | None = None,
     month: int | None = None,
+    season: str | None = None,
 ):
     district_name, subdistrict_name, village_name = require_places(district_name, subdistrict_name, village_name)
     named = bool(subdistrict_name) and not is_block(subdistrict_name)
     if named and village_name:
-        return stream_named_village_fields(district_name, subdistrict_name, village_name, year, month)
+        return stream_named_village_fields(
+            district_name, subdistrict_name, village_name, year, month, season
+        )
     if named:
         return named_subdistrict_payload(district_name, subdistrict_name)
     if subdistrict_name and village_name:
@@ -836,21 +861,95 @@ def name_response(district_name: str | None, subdistrict_name: str | None) -> di
     }
 
 
+@router.get("/boundaries/villages")
+def list_village_areas(
+    district_name: Annotated[str | None, Query(description="Optional district filter")] = None,
+    subdistrict_name: Annotated[str | None, Query(description="Optional subdistrict / tehsil filter")] = None,
+) -> dict[str, Any]:
+    """All villages with total field area in one response (from field_boundaries)."""
+    clauses = ["1=1"]
+    params: dict[str, Any] = {}
+    district_name = clean(district_name)
+    subdistrict_name = clean(subdistrict_name)
+    if district_name:
+        clauses.append("district = :district")
+        params["district"] = district_name
+    if subdistrict_name:
+        clauses.append("sub_dist = :subdistrict")
+        params["subdistrict"] = subdistrict_name
+    where_sql = " AND ".join(clauses)
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                f"""
+                SELECT
+                  MIN(district) AS district_name,
+                  MIN(sub_dist) AS subdistrict_name,
+                  village_name,
+                  MIN(village_id) AS village_id,
+                  COUNT(*) AS fields,
+                  COALESCE(SUM(area_ha), 0) AS area_ha
+                FROM field_boundaries
+                WHERE {where_sql}
+                  AND village_name IS NOT NULL
+                  AND TRIM(village_name) <> ''
+                GROUP BY village_name, district, sub_dist
+                ORDER BY village_name
+                """
+            ),
+            params,
+        ).mappings().all()
+    villages = []
+    total_area = 0.0
+    total_fields = 0
+    for row in rows:
+        area = float(row["area_ha"] or 0)
+        fields = int(row["fields"] or 0)
+        total_area += area
+        total_fields += fields
+        villages.append(
+            {
+                "village": row["village_name"],
+                "village_id": int(row["village_id"]) if row["village_id"] is not None else None,
+                "district_name": row["district_name"],
+                "subdistrict_name": row["subdistrict_name"],
+                "fields": fields,
+                "area_ha": round(area, 4),
+            }
+        )
+    return {
+        "count": len(villages),
+        "fields": total_fields,
+        "total_area_ha": round(total_area, 4),
+        "district_name": district_name,
+        "subdistrict_name": subdistrict_name,
+        "villages": villages,
+    }
+
+
 @router.get("/boundaries", response_model=None)
 def get_boundaries(
     district_name: Annotated[str, Query(description="District name, for example Chhattisgarh")],
     subdistrict_name: Annotated[str | None, Query(description="Subdistrict block, for example r5c1")] = None,
     village_name: Annotated[str | None, Query(description="Village name, for example Chhattisgarh")] = None,
-    year: Annotated[int | None, Query(ge=1900, le=2100, description="Observation year")] = None,
-    month: Annotated[int | None, Query(ge=1, le=12, description="Observation month")] = None,
+    year: Annotated[int | None, Query(ge=1900, le=2100, description="Kharif / observation year")] = None,
+    month: Annotated[int | None, Query(ge=1, le=12, description="Observation month (optional)")] = None,
+    season: Annotated[str | None, Query(description="Crop calendar season: kharif or rabi")] = None,
 ):
-    """District outline, subdistrict plus village outlines, or field polygons for the selected period."""
-    return boundary_response(district_name, subdistrict_name, village_name, year, month)
+    """District outline, subdistrict plus village outlines, or field polygons for year + season."""
+    return boundary_response(district_name, subdistrict_name, village_name, year, month, season)
 
 
 @router.post("/boundaries", response_model=None)
 def post_boundaries(body: BoundaryRequest):
-    return boundary_response(body.district_name, body.subdistrict_name, body.village_name, body.year, body.month)
+    return boundary_response(
+        body.district_name,
+        body.subdistrict_name,
+        body.village_name,
+        body.year,
+        body.month,
+        body.season,
+    )
 
 
 @router.get("/boundaries/names")

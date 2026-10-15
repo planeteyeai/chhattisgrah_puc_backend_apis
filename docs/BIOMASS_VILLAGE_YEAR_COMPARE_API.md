@@ -48,6 +48,9 @@ Related (not required for the compare panel, useful for docs / tools):
 | `GET /biomass/summary` | District totals by label / by single crop |
 | `GET /biomass/village` | One village, one year, paged field rows |
 | `GET /biomass/fields` | Paged field rows by year / place |
+| `GET /boundaries/villages` | All villages with total field `area_ha` in one call |
+| `GET /boundaries?…&year=Y&season=kharif\|rabi` | Village field polygons for that calendar season only |
+| `GET /crops/summary?year=Y&season=…` / `/crops/places?…` | Crop stats filtered to season crops |
 
 **Rule:** year compare always sums the whole village for that year. Never join on `field_id` across years.
 

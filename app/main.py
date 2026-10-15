@@ -123,6 +123,7 @@ def api_index() -> dict[str, object]:
             "crop_points": "/crops/points?subdistrict=r0c5",
             "place_boundaries": "/boundaries?district_name=Chhattisgarh&subdistrict_name=r5c1&village_name=Chhattisgarh",
             "place_names": "/boundaries/names?district_name=Chhattisgarh",
+            "village_areas": "/boundaries/villages",
             "indices_aggregated": "/indices/retrieve-aggregated?district=Ahmadnagar&frequency=monthly",
             "indices_retrieve": "/indices/retrieve?district=Ahmadnagar&start_date=2024-01-01&end_date=2024-12-31",
             "indices_locations": "/indices/stored-locations?district=Ahmadnagar",

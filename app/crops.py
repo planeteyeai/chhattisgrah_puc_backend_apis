@@ -6,6 +6,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.crop_calendar import (
+    calendar_label_sql,
+    parse_calendar_season,
+    season_display_label_sql,
+)
 from app.database import get_db
 from app.geojson import json_safe
 
@@ -80,8 +85,17 @@ def _filters(
         clauses.append("final_label = :label")
         params["label"] = label
     if season:
-        clauses.append("season = :season")
-        params["season"] = season
+        # `kharif` / `rabi` = Chhattisgarh crop calendar. Any other value matches
+        # the stored identification season string (e.g. "Kharif 2025").
+        try:
+            calendar = parse_calendar_season(season)
+        except HTTPException:
+            calendar = None
+        if calendar:
+            clauses.append(calendar_label_sql(calendar, "final_label"))
+        elif season.strip().lower() not in ("all", "both", "*"):
+            clauses.append("season = :season")
+            params["season"] = season
     if rice_only:
         clauses.append("is_rice = 1")
     return " AND ".join(clauses), params
@@ -110,8 +124,13 @@ def crop_summary(
     db: Session = Depends(get_db),
     year: Annotated[int | None, Query(ge=1900, le=2100)] = None,
     month: Annotated[int | None, Query(ge=1, le=12)] = None,
+    season: Annotated[str | None, Query(description="Crop calendar season: kharif or rabi")] = None,
 ) -> dict[str, Any]:
     where_sql, params = period_filter(year, month)
+    calendar = parse_calendar_season(season)
+    if calendar:
+        where_sql = f"{where_sql} AND {calendar_label_sql(calendar, 'final_label')}"
+    label_expr = season_display_label_sql(calendar, "final_label")
     totals = db.execute(
         text(
             f"""
@@ -135,10 +154,10 @@ def crop_summary(
     labels = db.execute(
         text(
             f"""
-            SELECT final_label AS label, COUNT(*) AS fields, COALESCE(SUM(area_ha), 0) AS area_ha
+            SELECT {label_expr} AS label, COUNT(*) AS fields, COALESCE(SUM(area_ha), 0) AS area_ha
             FROM crop_identification
             WHERE {where_sql}
-            GROUP BY final_label
+            GROUP BY {label_expr}
             ORDER BY fields DESC
             """
         ),
@@ -183,6 +202,7 @@ def crop_summary(
     return {
         "year": year,
         "month": month,
+        "season": calendar,
         "fields": api_value(totals["fields"]),
         "area_ha": api_value(totals["area_ha"]),
         "rice_fields": api_value(totals["rice_fields"]),
@@ -205,8 +225,13 @@ def crop_places(
     db: Session = Depends(get_db),
     year: Annotated[int | None, Query(ge=1900, le=2100)] = None,
     month: Annotated[int | None, Query(ge=1, le=12)] = None,
+    season: Annotated[str | None, Query(description="Crop calendar season: kharif or rabi")] = None,
 ) -> dict[str, Any]:
     where_sql, params = period_filter(year, month)
+    calendar = parse_calendar_season(season)
+    if calendar:
+        where_sql = f"{where_sql} AND {calendar_label_sql(calendar, 'final_label')}"
+    label_expr = season_display_label_sql(calendar, "final_label")
     rows = db.execute(
         text(
             f"""
@@ -214,12 +239,12 @@ def crop_places(
               district_name,
               subdistrict_name,
               village_name,
-              final_label,
+              {label_expr} AS final_label,
               COUNT(*) AS fields,
               COALESCE(SUM(area_ha), 0) AS area_ha
             FROM crop_identification
             WHERE {where_sql}
-            GROUP BY district_name, subdistrict_name, village_name, final_label
+            GROUP BY district_name, subdistrict_name, village_name, {label_expr}
             """
         ),
         params,
@@ -253,7 +278,7 @@ def crop_places(
     )
     for place in ordered:
         place["area_ha"] = round(place["area_ha"], 4)
-    return {"count": len(ordered), "places": ordered}
+    return {"count": len(ordered), "season": calendar, "places": ordered}
 
 
 @router.get("/fields")
@@ -275,6 +300,11 @@ def crop_fields(
     Keep requesting skip=next_skip until has_more is false.
     """
     where_sql, params = _filters(district, subdistrict, village, label, season, rice_only, year, month)
+    try:
+        calendar = parse_calendar_season(season)
+    except HTTPException:
+        calendar = None
+    label_expr = season_display_label_sql(calendar, "final_label")
     total = int(
         db.execute(text(f"SELECT COUNT(*) FROM crop_identification WHERE {where_sql}"), params).scalar_one()
     )
@@ -283,7 +313,7 @@ def crop_fields(
             f"""
             SELECT
               id, field_boundary_id, field_id, district_name, subdistrict_name, village_name,
-              season, observation_date, identified_on, predicted_crop, final_label,
+              season, observation_date, identified_on, predicted_crop, {label_expr} AS final_label,
               is_rice, confidence, margin, area_ha, source_model, centroid_lon, centroid_lat
             FROM crop_identification
             WHERE {where_sql}
@@ -307,6 +337,7 @@ def crop_fields(
         "count": count,
         "has_more": has_more,
         "next_skip": skip + count if has_more else None,
+        "season": calendar,
         "fields": fields,
     }
 
