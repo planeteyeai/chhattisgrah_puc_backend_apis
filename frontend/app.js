@@ -125,6 +125,7 @@ const state = {
   indexFallback: null,
   indexDone: -1,
   indexCronDone: -1,
+  indexStoreRunning: false,
   indexFingerprint: null,
   indexPinned: false,
   indexPoll: null,
@@ -1176,9 +1177,16 @@ async function refreshIndexStatus() {
   const storeDone = storeStatus.locations_done || 0;
   const cronDone = cronStatus.locations_done_this_cycle || 0;
   const active = Boolean(storeStatus.running || cronStatus.running);
-  if (active) {
+  const progressed =
+    storeDone !== state.indexDone ||
+    cronDone !== state.indexCronDone ||
+    (state.indexStoreRunning && !storeStatus.running);
+  state.indexStoreRunning = Boolean(storeStatus.running);
+  if (active || progressed) {
     state.indexDone = storeDone;
     state.indexCronDone = cronDone;
+    // Force reload so a finished village switches from proxy → exact series.
+    if (progressed) state.indexFingerprint = null;
     await loadIndexTrend();
   }
   return storeStatus;

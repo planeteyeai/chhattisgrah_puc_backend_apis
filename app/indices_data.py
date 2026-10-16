@@ -391,7 +391,8 @@ def _write_sticky_fallback(
         )
 
 
-def _clear_sticky_fallback(district: str, subdistrict: str, village: str) -> None:
+def clear_sticky_fallback(district: str, subdistrict: str, village: str) -> None:
+    """Drop proxy mapping so the next read uses this village's exact stored series."""
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -488,25 +489,43 @@ def resolve_series_location(
 ) -> tuple[str, str, str, dict[str, Any] | None]:
     """Return the location to read, with a sticky nearest-village fallback when empty.
 
-    Once a fallback source is chosen it is persisted so refresh keeps the same series
-    until the requested village has its own stored rows.
+    A sticky proxy stays in place across refreshes (and while that village is still
+    being stored). Store completion clears the sticky row, and the next read returns
+    that village's exact series.
     """
     district_name, subdistrict_name, village_name = normalize_location(district, subdistrict, village)
     if not village_name:
-        return district_name, subdistrict_name, village_name, None
-    if location_has_rows(district_name, subdistrict_name, village_name):
-        _clear_sticky_fallback(district_name, subdistrict_name, village_name)
         return district_name, subdistrict_name, village_name, None
 
     sticky = _read_sticky_fallback(district_name, subdistrict_name, village_name)
     if sticky and location_has_rows(sticky[0], sticky[1], sticky[2]):
         source = sticky
-    else:
-        source = _nearest_stored_village(district_name, subdistrict_name, village_name)
-        if source is None:
-            return district_name, subdistrict_name, village_name, None
-        _write_sticky_fallback(district_name, subdistrict_name, village_name, source)
+        meta = {
+            "requested": {
+                "district": district_name,
+                "subdistrict": subdistrict_name,
+                "village": village_name,
+            },
+            "source": {
+                "district": source[0],
+                "subdistrict": source[1],
+                "village": source[2],
+            },
+            "sticky": True,
+            "note": (
+                f"No indices stored yet for {village_name}; "
+                f"showing nearest stored village {source[2]} until this village is stored."
+            ),
+        }
+        return source[0], source[1], source[2], meta
 
+    if location_has_rows(district_name, subdistrict_name, village_name):
+        return district_name, subdistrict_name, village_name, None
+
+    source = _nearest_stored_village(district_name, subdistrict_name, village_name)
+    if source is None:
+        return district_name, subdistrict_name, village_name, None
+    _write_sticky_fallback(district_name, subdistrict_name, village_name, source)
     meta = {
         "requested": {
             "district": district_name,

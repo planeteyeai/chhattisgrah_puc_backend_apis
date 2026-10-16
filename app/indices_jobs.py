@@ -14,6 +14,7 @@ from app.database import engine
 from app.indices_stac import compute_scene, list_sentinel2
 from app.indices_data import (
     INDEX_COLUMNS,
+    clear_sticky_fallback,
     ensure_indices_schema,
     list_village_locations,
     location_has_obs_between,
@@ -229,6 +230,9 @@ def store_windows(
         for scene in scenes:
             scene_date = scene.get("obs_date") or obs
             _log_progress(district, subdistrict, village, scene_date, "stored")
+    # Store finished for this place: drop sticky proxy so reads return exact series.
+    if village and written > 0:
+        clear_sticky_fallback(district, subdistrict, village)
     return {
         "location": _location_payload(district, subdistrict, village),
         "observation_dates": [item.isoformat() for item in dates],
