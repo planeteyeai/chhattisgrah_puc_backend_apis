@@ -21,8 +21,10 @@ from app.indices_data import (
     ensure_indices_schema,
     list_village_locations,
     normalize_location,
+    pending_locations,
     raw_series,
     resolve_geometry,
+    resolve_series_location,
     stored_locations,
 )
 from app.indices_jobs import (
@@ -78,14 +80,22 @@ def retrieve_indices_aggregated(
         Query(description="Reserved input; not applied on indices table"),
     ] = None,
 ) -> dict[str, Any]:
-    """Average the 21 stored indices by week, month, or year."""
+    """Average the 21 stored indices by week, month, or year.
+
+    When the requested village has no rows yet, returns the nearest already-stored
+    village series. That proxy choice is sticky across refreshes until the village
+    itself is stored.
+    """
     ensure_indices_schema()
     if frequency not in {"weekly", "monthly", "yearly"}:
         raise HTTPException(
             status_code=400,
             detail="Unsupported frequency. Use weekly, monthly, or yearly.",
         )
-    series = aggregated_series(district, subdistrict, village, frequency)
+    read_district, read_subdistrict, read_village, fallback = resolve_series_location(
+        district, subdistrict, village
+    )
+    series = aggregated_series(read_district, read_subdistrict, read_village, frequency)
     return {
         "count": len(series),
         "filters": {
@@ -95,8 +105,14 @@ def retrieve_indices_aggregated(
             "frequency": frequency,
             "croptype": croptype,
         },
+        "read_location": {
+            "district": read_district,
+            "subdistrict": read_subdistrict,
+            "village": read_village,
+        },
+        "fallback": fallback,
         "croptype_applied": False,
-        "note": CROPTYPE_NOTE,
+        "note": CROPTYPE_NOTE if fallback is None else fallback["note"],
         "series": series,
     }
 
@@ -110,10 +126,27 @@ def retrieve_indices(
     end_date: DateQuery = None,
     limit: Annotated[int, Query(ge=1, le=200000)] = 50000,
 ) -> dict[str, Any]:
-    """Raw Sentinel-2 scene rows for one location filter."""
+    """Raw Sentinel-2 scene rows for one location filter.
+
+    Uses the same sticky nearest-village fallback as retrieve-aggregated when empty.
+    """
     ensure_indices_schema()
-    series = raw_series(district, subdistrict, village, start_date, end_date, limit)
-    return {"count": len(series), "series": series}
+    read_district, read_subdistrict, read_village, fallback = resolve_series_location(
+        district, subdistrict, village
+    )
+    series = raw_series(
+        read_district, read_subdistrict, read_village, start_date, end_date, limit
+    )
+    return {
+        "count": len(series),
+        "read_location": {
+            "district": read_district,
+            "subdistrict": read_subdistrict,
+            "village": read_village,
+        },
+        "fallback": fallback,
+        "series": series,
+    }
 
 
 @router.get("/stored-locations")
@@ -210,6 +243,10 @@ def store_all_locations(
     window_half_days: Annotated[int | None, Query()] = None,
     district: Annotated[str | None, Query(description="Optional district filter; omit for all districts")] = None,
     max_locations: Annotated[int, Query(ge=0, description="0 = all")] = 0,
+    pending_only: Annotated[
+        bool,
+        Query(description="If true, only villages that still have no indices rows"),
+    ] = False,
     sync: Annotated[bool, Query(description="Run in request if true; else async background")] = False,
 ) -> dict[str, Any]:
     """Store scene indices for every village, subdistrict, and district."""
@@ -219,7 +256,20 @@ def store_all_locations(
     if store_is_running():
         raise HTTPException(status_code=409, detail="Index storage is already running")
     resolved_end = end_date or _today()
-    locations = list_village_locations(district, max_locations)
+    if pending_only:
+        locations = pending_locations(district, max_locations, villages_only=True)
+    else:
+        locations = list_village_locations(district, max_locations)
+    if not locations:
+        return {
+            "status": "done",
+            "mode": "noop",
+            "locations": 0,
+            "pending_only": pending_only,
+            "years": years,
+            "step_days": step_days,
+            "end_date": resolved_end,
+        }
     payload = {
         "years": years,
         "step_days": step_days,
@@ -231,12 +281,18 @@ def store_all_locations(
     }
     if sync:
         run_store_all(**payload)
-        return {"status": "done", "locations": len(locations), "mode": "sync"}
+        return {
+            "status": "done",
+            "locations": len(locations),
+            "mode": "sync",
+            "pending_only": pending_only,
+        }
     start_store_all_background(**payload)
     return {
         "status": "accepted",
         "mode": "background",
         "locations": len(locations),
+        "pending_only": pending_only,
         "years": years,
         "step_days": step_days,
         "end_date": resolved_end,

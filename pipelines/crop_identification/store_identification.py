@@ -28,11 +28,21 @@ from sqlalchemy.exc import OperationalError
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
+from app.config import settings  # noqa: E402
 from app.database import engine  # noqa: E402
 
 SCRIPT_DIR = Path(__file__).parent
 KEEP = ("Rice", "Cotton", "Sugarcane")
-GEE_PROJECT = os.environ.get("EE_PROJECT", "inlaid-way-490106-u1")
+CROP_ALIASES = {
+    "rice": "Rice",
+    "cotton": "Cotton",
+    "sugarcane": "Sugarcane",
+}
+GEE_PROJECT = (
+    settings.ee_project
+    or os.environ.get("EE_PROJECT")
+    or "sunny-state-481204-a5"
+)
 CONFIDENCE_THRESHOLD = 0.75
 MARGIN_THRESHOLD = 0.20
 MIN_AREA_M2 = 900.0
@@ -373,7 +383,20 @@ def load_village(name: str) -> list[dict]:
     return plots
 
 
-def classify_village(plots, year, full, sugarcane):
+def resolve_keep(crop: str | None) -> tuple[str, ...]:
+    """Limit stored labels. `-c rice` keeps Rice only and leaves other crops untouched."""
+    if not crop:
+        return KEEP
+    key = str(crop).strip().lower()
+    if key in ("all", "*", "rcs"):
+        return KEEP
+    label = CROP_ALIASES.get(key) or next((name for name in KEEP if name.lower() == key), None)
+    if label is None:
+        raise SystemExit(f"Unsupported crop {crop!r}. Use: rice, cotton, sugarcane, or all.")
+    return (label,)
+
+
+def classify_village(plots, year, full, sugarcane, keep: tuple[str, ...] = KEEP):
     usable = []
     rejected = []
     broken = []
@@ -459,7 +482,7 @@ def classify_village(plots, year, full, sugarcane):
             margin = round(margin_full, 4)
             source = "full_7class"
             observed = (september[index] or {}).get("scene_date") or date(year, 9, 15)
-        if final_label not in KEEP:
+        if final_label not in keep:
             continue
         points = plot["pts"]
         stored.append({
@@ -507,52 +530,104 @@ def acquire_lock(lock_path: Path, stale_seconds: float = 180) -> int:
             time.sleep(0.2)
 
 
-def write_village(year: int, village: str, stored: list[dict], failed: set[int], rejected: set[int], broken: set[int]) -> None:
+def write_village(
+    year: int,
+    village: str,
+    stored: list[dict],
+    failed: set[int],
+    rejected: set[int],
+    broken: set[int],
+    keep: tuple[str, ...] = KEEP,
+) -> None:
     season = f"Kharif {year}"
     kept = {row["field_boundary_id"] for row in stored}
     protect = failed | broken
     ordered = sorted(stored, key=lambda row: row["field_boundary_id"])
+    # Crop-scoped runs only replace that crop's rows so Cotton/Sugarcane survive a rice-only pass.
+    scoped = keep != KEEP
     with engine.begin() as conn:
-        existing = {
-            int(value)
-            for value in conn.execute(
-                text(
-                    """
-                    SELECT field_boundary_id
-                    FROM crop_identification
-                    WHERE season = :season AND village_name = :village AND field_boundary_id IS NOT NULL
-                    """
-                ),
-                {"season": season, "village": village},
-            ).scalars()
-        }
+        if scoped:
+            existing = {
+                int(value)
+                for value in conn.execute(
+                    text(
+                        """
+                        SELECT field_boundary_id
+                        FROM crop_identification
+                        WHERE season = :season
+                          AND village_name = :village
+                          AND field_boundary_id IS NOT NULL
+                          AND final_label IN :labels
+                        """
+                    ).bindparams(bindparam("labels", expanding=True)),
+                    {"season": season, "village": village, "labels": list(keep)},
+                ).scalars()
+            }
+        else:
+            existing = {
+                int(value)
+                for value in conn.execute(
+                    text(
+                        """
+                        SELECT field_boundary_id
+                        FROM crop_identification
+                        WHERE season = :season AND village_name = :village AND field_boundary_id IS NOT NULL
+                        """
+                    ),
+                    {"season": season, "village": village},
+                ).scalars()
+            }
         for start in range(0, len(ordered), 200):
             conn.execute(UPSERT, ordered[start : start + 200])
         remove = sorted(value for value in existing if value not in kept and value not in protect)
         for start in range(0, len(remove), 400):
             chunk = remove[start : start + 400]
-            conn.execute(
-                text(
-                    """
-                    DELETE FROM crop_identification
-                    WHERE season = :season AND field_boundary_id IN :ids
-                    """
-                ).bindparams(bindparam("ids", expanding=True)),
-                {"season": season, "ids": chunk},
-            )
+            if scoped:
+                conn.execute(
+                    text(
+                        """
+                        DELETE FROM crop_identification
+                        WHERE season = :season
+                          AND field_boundary_id IN :ids
+                          AND final_label IN :labels
+                        """
+                    ).bindparams(
+                        bindparam("ids", expanding=True),
+                        bindparam("labels", expanding=True),
+                    ),
+                    {"season": season, "ids": chunk, "labels": list(keep)},
+                )
+            else:
+                conn.execute(
+                    text(
+                        """
+                        DELETE FROM crop_identification
+                        WHERE season = :season AND field_boundary_id IN :ids
+                        """
+                    ).bindparams(bindparam("ids", expanding=True)),
+                    {"season": season, "ids": chunk},
+                )
         print(
-            f"  stored {len(stored)}  deleted {len(remove)}  kept-on-failure {len(protect & existing)}  rejected {len(rejected)}",
+            f"  stored {len(stored)}  deleted {len(remove)}  kept-on-failure {len(protect & existing)}  rejected {len(rejected)}  crops={','.join(keep)}",
             flush=True,
         )
 
 
-def apply_village(year: int, village: str, stored: list[dict], failed: set[int], rejected: set[int], broken: set[int]) -> None:
+def apply_village(
+    year: int,
+    village: str,
+    stored: list[dict],
+    failed: set[int],
+    rejected: set[int],
+    broken: set[int],
+    keep: tuple[str, ...] = KEEP,
+) -> None:
     lock_path = SCRIPT_DIR / "identification_db.lock"
     fd = acquire_lock(lock_path)
     try:
         for attempt in range(1, 6):
             try:
-                write_village(year, village, stored, failed, rejected, broken)
+                write_village(year, village, stored, failed, rejected, broken, keep=keep)
                 return
             except OperationalError as exc:
                 if mysql_errno(exc) not in (1205, 1213) or attempt == 5:
@@ -629,6 +704,17 @@ def release_busy(progress_path: Path) -> None:
     with_progress_lock(progress_path, update)
 
 
+def reset_year_progress(progress_path: Path, years: list[int]) -> None:
+    """Clear done/busy markers so a re-run covers every village again."""
+
+    def update(progress: dict) -> None:
+        for year in years:
+            progress[str(year)] = []
+            progress[f"busy-{year}"] = []
+
+    with_progress_lock(progress_path, update)
+
+
 def village_names(only: str | None) -> list[str]:
     if only:
         return [only]
@@ -643,10 +729,24 @@ def main() -> None:
     parser.add_argument("--year", type=int, action="append", dest="years")
     parser.add_argument("--village", default=None)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument(
+        "-c",
+        "--crop",
+        default=None,
+        help="Store only this crop: rice, cotton, sugarcane (default: all three). Scoped runs do not delete other crops.",
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Reset village progress for the selected years before starting.",
+    )
     args = parser.parse_args()
     years = args.years or [2025, 2024]
+    keep = resolve_keep(args.crop)
+    progress_path = SCRIPT_DIR / "identification_progress.json"
+    if args.fresh:
+        reset_year_progress(progress_path, years)
     if args.workers > 1 and not args.village:
-        progress_path = SCRIPT_DIR / "identification_progress.json"
         release_busy(progress_path)
         (SCRIPT_DIR / "identification_db.lock").unlink(missing_ok=True)
         processes = []
@@ -654,15 +754,17 @@ def main() -> None:
             command = [sys.executable, "-u", str(Path(__file__).resolve())]
             for year in years:
                 command.extend(["--year", str(year)])
+            if args.crop:
+                command.extend(["-c", args.crop])
             processes.append(subprocess.Popen(command))
         raise SystemExit(max(process.wait() for process in processes))
     print(f"Earth Engine project: {GEE_PROJECT}", flush=True)
+    print(f"Storing crops: {', '.join(keep)}", flush=True)
     ee.Initialize(project=GEE_PROJECT)
     full, sugarcane = load_models()
     print(f"Full model: {full['label_names']}", flush=True)
     print(f"Sugarcane model: {sugarcane['label_names']}", flush=True)
     names = village_names(args.village)
-    progress_path = SCRIPT_DIR / "identification_progress.json"
     pd.set_option("future.no_silent_downcasting", True)
     for year in years:
         total = len(names)
@@ -674,9 +776,9 @@ def main() -> None:
             started = time.time()
             print(f"[{year}] {name}", flush=True)
             plots = load_village(name)
-            stored, failed, rejected, broken = classify_village(plots, year, full, sugarcane)
+            stored, failed, rejected, broken = classify_village(plots, year, full, sugarcane, keep=keep)
             try:
-                apply_village(year, name, stored, failed, rejected, broken)
+                apply_village(year, name, stored, failed, rejected, broken, keep=keep)
             except OperationalError as exc:
                 if mysql_errno(exc) not in (1205, 1213):
                     raise

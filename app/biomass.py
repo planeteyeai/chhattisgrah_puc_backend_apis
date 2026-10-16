@@ -33,7 +33,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, NamedTuple
 
 from fastapi import APIRouter, HTTPException, Query
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from app.crop_calendar import CALENDAR_SEASON, parse_calendar_season
 from app.database import engine
@@ -360,15 +360,31 @@ def ensure_biomass_schema() -> None:
         ):
             if name not in columns:
                 conn.execute(text(f"ALTER TABLE biomass ADD COLUMN {name} {ddl} AFTER {after}"))
-        conn.execute(
+        needs_kharif_backfill = conn.execute(
             text(
                 """
-                UPDATE biomass
-                SET kharif_crop = crop, kharif_t_ha = biomass_t_ha, kharif_tonnes = total_tonnes
+                SELECT 1
+                FROM biomass
                 WHERE kharif_crop IS NULL AND rabi_crop IS NULL AND crop IN ('Rice', 'Cotton')
+                LIMIT 1
                 """
             )
-        )
+        ).first()
+        if needs_kharif_backfill is not None:
+            # Batch to avoid long table locks when indices/store jobs are writing.
+            while True:
+                result = conn.execute(
+                    text(
+                        """
+                        UPDATE biomass
+                        SET kharif_crop = crop, kharif_t_ha = biomass_t_ha, kharif_tonnes = total_tonnes
+                        WHERE kharif_crop IS NULL AND rabi_crop IS NULL AND crop IN ('Rice', 'Cotton')
+                        LIMIT 2000
+                        """
+                    )
+                )
+                if (result.rowcount or 0) < 2000:
+                    break
         indexes = {
             str(name).lower()
             for name in conn.execute(
@@ -437,14 +453,47 @@ def _load_fields() -> list[dict[str, Any]]:
     return list(chosen.values())
 
 
+def pending_biomass_villages(years: tuple[int, ...] | None = None) -> list[str]:
+    """Villages that have usable crop identification rows still missing from biomass."""
+    fields = _load_fields()
+    if years is not None:
+        wanted = set(years)
+        fields = [row for row in fields if row["year"] in wanted]
+    if not fields:
+        return []
+    crop_ids = [int(row["id"]) for row in fields]
+    missing: set[str] = set()
+    with engine.connect() as conn:
+        for start in range(0, len(crop_ids), 1000):
+            chunk = crop_ids[start : start + 1000]
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT c.village_name
+                    FROM crop_identification c
+                    LEFT JOIN biomass b ON b.crop_id = c.id
+                    WHERE c.id IN :ids AND b.crop_id IS NULL
+                    """
+                ).bindparams(bindparam("ids", expanding=True)),
+                {"ids": chunk},
+            ).mappings()
+            for row in rows:
+                name = (row["village_name"] or "").strip()
+                if name:
+                    missing.add(name)
+    return sorted(missing, key=str.lower)
+
+
 def store_biomass(
     years: tuple[int, ...] | None = None,
     seasons: tuple[str, ...] | None = None,
+    villages: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     """Replace stored biomass for the requested Kharif years and calendar seasons.
 
     `years` are Kharif years (e.g. 2023 means Kharif 2023 and Rabi 2023-24).
     `seasons` is `kharif`, `rabi`, or both (default). Only matching calendar crops are stored.
+    When `villages` is set, only those villages are replaced (other villages stay intact).
     """
     ensure_biomass_schema()
     seasons = parse_seasons(list(seasons) if seasons else None)
@@ -452,8 +501,18 @@ def store_biomass(
     if years is None:
         years = tuple(sorted({row["year"] for row in fields}))
     if not years:
-        return {"years": [], "seasons": list(seasons or ("kharif", "rabi")), "stored": 0, "skipped": {}, "results": []}
+        return {
+            "years": [],
+            "seasons": list(seasons or ("kharif", "rabi")),
+            "villages": list(villages or []),
+            "stored": 0,
+            "skipped": {},
+            "results": [],
+        }
     fields = [row for row in fields if row["year"] in years]
+    if villages:
+        wanted = {name.strip().lower() for name in villages if name and name.strip()}
+        fields = [row for row in fields if (row["village_name"] or "").strip().lower() in wanted]
     scenes = _load_scenes(season_start(min(years)), date(max(years) + 1, 6, 1))
     created_at = datetime.now(timezone.utc).replace(tzinfo=None)
     rate_cache: dict[tuple[int, str, str], tuple[dict[str, tuple[float, int, date, date]], tuple[float, date, date] | None]] = {}
@@ -556,11 +615,26 @@ def store_biomass(
         )
         """
     )
-    with engine.begin() as conn:
-        for year in years:
-            conn.execute(text("DELETE FROM biomass WHERE `year` = :year"), {"year": year})
-        for start in range(0, len(payload), 1000):
-            conn.execute(insert_sql, payload[start : start + 1000])
+    village_names = sorted(
+        {(row["village_name"] or "").strip() for row in fields if (row["village_name"] or "").strip()},
+        key=str.lower,
+    )
+    # Commit per village/year so a full-year DELETE cannot lock the whole table
+    # while the Railway API or another job is reading biomass.
+    by_village_year: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for item in payload:
+        key = ((item["village_name"] or "").strip(), int(item["year"]))
+        by_village_year.setdefault(key, []).append(item)
+    for year in years:
+        for name in village_names:
+            chunk = by_village_year.get((name, int(year)), [])
+            with engine.begin() as conn:
+                conn.execute(
+                    text("DELETE FROM biomass WHERE `year` = :year AND village_name = :village"),
+                    {"year": year, "village": name},
+                )
+                for start in range(0, len(chunk), 500):
+                    conn.execute(insert_sql, chunk[start : start + 500])
     rows = []
     for bucket in summary.values():
         bucket["area_ha"] = round(bucket["area_ha"], 2)
@@ -571,6 +645,7 @@ def store_biomass(
     return {
         "years": list(years),
         "seasons": list(seasons or ("kharif", "rabi")),
+        "villages": village_names if villages else [],
         "stored": len(payload),
         "skipped": skipped,
         "results": rows,
@@ -1248,6 +1323,7 @@ def biomass_fields(
 if __name__ == "__main__":
     import argparse
     import json
+    import time
 
     parser = argparse.ArgumentParser(
         description="Recalculate and store biomass by Kharif year and Chhattisgarh season (kharif/rabi)."
@@ -1262,7 +1338,115 @@ if __name__ == "__main__":
         default="kharif,rabi",
         help="Comma-separated seasons: kharif,rabi. Default: both.",
     )
+    parser.add_argument(
+        "--villages",
+        default="",
+        help="Comma-separated village names. Default: all villages in crop_identification.",
+    )
+    parser.add_argument(
+        "--pending",
+        action="store_true",
+        help="Only villages that still have crop rows missing from biomass.",
+    )
+    parser.add_argument(
+        "--loop",
+        action="store_true",
+        help="Keep scanning for pending/new villages and store them continuously.",
+    )
+    parser.add_argument(
+        "--sleep",
+        type=int,
+        default=120,
+        help="Seconds to wait between continuous passes when --loop is set (default: 120).",
+    )
+    from sqlalchemy.exc import OperationalError
+
     args = parser.parse_args()
     chosen_years = tuple(int(year) for year in args.years.split(",") if year.strip()) or None
     chosen_seasons = parse_seasons([args.seasons])
-    print(json.dumps(store_biomass(chosen_years, chosen_seasons), default=str, indent=2), flush=True)
+    named = tuple(name.strip() for name in args.villages.split(",") if name.strip()) or None
+
+    def resolve_targets() -> tuple[str, ...]:
+        targets = named
+        if args.pending or args.loop:
+            pending = pending_biomass_villages(chosen_years)
+            if named:
+                wanted = {name.lower() for name in named}
+                pending = [name for name in pending if name.lower() in wanted]
+            targets = tuple(pending)
+        return targets or ()
+
+    def store_one_village(village: str, attempts: int = 4) -> dict[str, Any]:
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return store_biomass(chosen_years, chosen_seasons, (village,))
+            except OperationalError as exc:
+                last_error = exc
+                wait = min(60, 5 * attempt)
+                print(
+                    f"  {village} MySQL error on attempt {attempt}/{attempts}: {exc}; retry in {wait}s",
+                    flush=True,
+                )
+                time.sleep(wait)
+        assert last_error is not None
+        raise last_error
+
+    def one_pass() -> dict[str, Any]:
+        targets = resolve_targets()
+        if (args.pending or args.loop) and not targets:
+            return {
+                "years": list(chosen_years or []),
+                "seasons": list(chosen_seasons or ("kharif", "rabi")),
+                "villages": [],
+                "stored": 0,
+                "skipped": {},
+                "results": [],
+                "pending": 0,
+                "failed": [],
+            }
+        if args.pending or args.loop or (targets and len(targets) > 1):
+            print(
+                f"Pending villages ({len(targets)}): {', '.join(targets[:20])}{'…' if len(targets) > 20 else ''}",
+                flush=True,
+            )
+            stored = 0
+            failed: list[str] = []
+            # One village per transaction so a dropped connection does not wipe the whole pass.
+            for village in targets:
+                try:
+                    result = store_one_village(village)
+                    stored += int(result.get("stored") or 0)
+                    print(f"  {village}: stored {result.get('stored', 0)}", flush=True)
+                except Exception as exc:  # noqa: BLE001 — keep the loop alive
+                    failed.append(village)
+                    print(f"  {village}: FAILED {exc}", flush=True)
+            return {
+                "years": list(chosen_years or []),
+                "seasons": list(chosen_seasons or ("kharif", "rabi")),
+                "villages": list(targets),
+                "stored": stored,
+                "pending": len(targets),
+                "failed": failed,
+            }
+        result = store_biomass(chosen_years, chosen_seasons, targets or None)
+        result["pending"] = len(targets)
+        result["failed"] = []
+        return result
+
+    if args.loop:
+        print(
+            f"Continuous biomass store started (years={chosen_years or 'all'}, seasons={chosen_seasons or ('kharif','rabi')}, sleep={args.sleep}s)",
+            flush=True,
+        )
+        while True:
+            started = time.time()
+            try:
+                body = one_pass()
+                print(json.dumps(body, default=str, indent=2), flush=True)
+            except Exception as exc:  # noqa: BLE001
+                print(f"Pass failed: {exc}; will retry after sleep", flush=True)
+            print(f"Pass finished in {round(time.time() - started)}s; sleeping {args.sleep}s", flush=True)
+            time.sleep(max(1, args.sleep))
+    else:
+        print(json.dumps(one_pass(), default=str, indent=2), flush=True)

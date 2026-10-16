@@ -182,6 +182,18 @@ def ensure_indices_schema() -> None:
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         """,
         """
+        CREATE TABLE IF NOT EXISTS `indices_fallback` (
+          `district` VARCHAR(191) NOT NULL,
+          `subdistrict` VARCHAR(191) NOT NULL DEFAULT '',
+          `village` VARCHAR(191) NOT NULL DEFAULT '',
+          `source_district` VARCHAR(191) NOT NULL,
+          `source_subdistrict` VARCHAR(191) NOT NULL DEFAULT '',
+          `source_village` VARCHAR(191) NOT NULL DEFAULT '',
+          `created_at` DATETIME NULL,
+          PRIMARY KEY (`district`, `subdistrict`, `village`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """,
+        """
         CREATE TABLE IF NOT EXISTS `indices_cron_checkpoint` (
           `id` TINYINT NOT NULL,
           `district` VARCHAR(191) NULL,
@@ -264,6 +276,255 @@ def _location_clause(
         clauses.append("LOWER(TRIM(COALESCE(village, ''))) = LOWER(TRIM(:village))")
         params["village"] = village
     return " AND ".join(clauses), params
+
+
+def location_has_rows(district: str, subdistrict: str | None, village: str | None) -> bool:
+    where, params = _location_clause(district, subdistrict, village)
+    sql = f"SELECT 1 FROM `indices` WHERE {where} LIMIT 1"
+    with engine.connect() as conn:
+        return conn.execute(text(sql), params).first() is not None
+
+
+def pending_locations(
+    district: str | None = None,
+    max_locations: int = 0,
+    *,
+    villages_only: bool = True,
+) -> list[tuple[str, str, str]]:
+    """Places from list_village_locations that do not yet have indices rows."""
+    locations = list_village_locations(district, max_locations=0)
+    if villages_only:
+        locations = [item for item in locations if item[2]]
+    stored = {
+        (item["district"], item["subdistrict"] or "", item["village"] or "")
+        for item in stored_locations(district, None, None, 200000)
+    }
+    pending = [item for item in locations if item not in stored]
+    if max_locations > 0:
+        pending = pending[:max_locations]
+    return pending
+
+
+_CENTROID_CACHE: dict[tuple[str, str, str], tuple[float, float] | None] = {}
+
+
+def _centroid_xy(district: str, subdistrict: str, village: str) -> tuple[float, float] | None:
+    key = (clean_text(district), clean_text(subdistrict), clean_text(village))
+    if key in _CENTROID_CACHE:
+        return _CENTROID_CACHE[key]
+    try:
+        geometry = resolve_geometry(district, subdistrict or None, village or None)
+    except LookupError:
+        _CENTROID_CACHE[key] = None
+        return None
+    try:
+        from shapely.geometry import shape
+
+        point = shape(geometry).centroid
+        if point.is_empty:
+            _CENTROID_CACHE[key] = None
+            return None
+        value = (float(point.x), float(point.y))
+    except Exception:
+        value = None
+    _CENTROID_CACHE[key] = value
+    return value
+
+
+def _read_sticky_fallback(district: str, subdistrict: str, village: str) -> tuple[str, str, str] | None:
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                """
+                SELECT source_district, source_subdistrict, source_village
+                FROM `indices_fallback`
+                WHERE LOWER(TRIM(district)) = LOWER(TRIM(:district))
+                  AND LOWER(TRIM(subdistrict)) = LOWER(TRIM(:subdistrict))
+                  AND LOWER(TRIM(village)) = LOWER(TRIM(:village))
+                LIMIT 1
+                """
+            ),
+            {"district": district, "subdistrict": subdistrict, "village": village},
+        ).mappings().first()
+    if not row:
+        return None
+    return (
+        str(row["source_district"] or ""),
+        str(row["source_subdistrict"] or ""),
+        str(row["source_village"] or ""),
+    )
+
+
+def _write_sticky_fallback(
+    district: str,
+    subdistrict: str,
+    village: str,
+    source: tuple[str, str, str],
+) -> None:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO `indices_fallback` (
+                  district, subdistrict, village,
+                  source_district, source_subdistrict, source_village, created_at
+                ) VALUES (
+                  :district, :subdistrict, :village,
+                  :source_district, :source_subdistrict, :source_village, :created_at
+                )
+                ON DUPLICATE KEY UPDATE
+                  source_district = VALUES(source_district),
+                  source_subdistrict = VALUES(source_subdistrict),
+                  source_village = VALUES(source_village)
+                """
+            ),
+            {
+                "district": district,
+                "subdistrict": subdistrict,
+                "village": village,
+                "source_district": source[0],
+                "source_subdistrict": source[1],
+                "source_village": source[2],
+                "created_at": now,
+            },
+        )
+
+
+def _clear_sticky_fallback(district: str, subdistrict: str, village: str) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                DELETE FROM `indices_fallback`
+                WHERE LOWER(TRIM(district)) = LOWER(TRIM(:district))
+                  AND LOWER(TRIM(subdistrict)) = LOWER(TRIM(:subdistrict))
+                  AND LOWER(TRIM(village)) = LOWER(TRIM(:village))
+                """
+            ),
+            {"district": district, "subdistrict": subdistrict, "village": village},
+        )
+
+
+def _village_centroids(district: str) -> dict[tuple[str, str], tuple[float, float]]:
+    """Batch-load village centroids for one district from admin polygons."""
+    names = _district_names(district)
+    if not names:
+        return {}
+    out: dict[tuple[str, str], tuple[float, float]] = {}
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT tehsil_name, village_name, geom_geojson
+                FROM kawardha_data
+                WHERE level = 'village'
+                  AND LOWER(TRIM(district_name)) IN :names
+                  AND geom_geojson IS NOT NULL
+                  AND village_name IS NOT NULL
+                  AND TRIM(village_name) <> ''
+                """
+            ).bindparams(bindparam("names", expanding=True)),
+            {"names": list(names)},
+        ).mappings()
+        from shapely.geometry import shape
+
+        for row in rows:
+            try:
+                sub = clean_text(row["tehsil_name"])
+                vil = clean_text(row["village_name"])
+                geometry = _geometry_from_json(row["geom_geojson"])
+                if not geometry:
+                    continue
+                point = shape(geometry).centroid
+                if point.is_empty:
+                    continue
+                out[(sub, vil)] = (float(point.x), float(point.y))
+            except Exception:
+                continue
+    return out
+
+
+def _nearest_stored_village(district: str, subdistrict: str, village: str) -> tuple[str, str, str] | None:
+    """Pick the nearest already-stored village. Tie-break is alphabetical (stable)."""
+    candidates = [
+        (item["district"], item["subdistrict"] or "", item["village"] or "")
+        for item in stored_locations(district, None, None, 200000)
+        if (item.get("village") or "").strip()
+        and clean_text(item.get("village")) != clean_text(village)
+    ]
+    if not candidates:
+        return None
+    same_sub = [
+        item for item in candidates if clean_text(item[1]) == clean_text(subdistrict)
+    ]
+    pool = same_sub or candidates
+    centroids = _village_centroids(district)
+    origin = centroids.get((clean_text(subdistrict), clean_text(village)))
+    if origin is None:
+        origin = _centroid_xy(district, subdistrict, village)
+    scored: list[tuple[float, str, str, str]] = []
+    for cand_district, cand_sub, cand_village in pool:
+        point = centroids.get((clean_text(cand_sub), clean_text(cand_village)))
+        if origin is not None and point is not None:
+            dx = origin[0] - point[0]
+            dy = origin[1] - point[1]
+            distance = dx * dx + dy * dy
+        else:
+            # Stable name distance when geometry is missing.
+            distance = abs(len(cand_village) - len(village)) + (
+                0 if cand_village[:1].lower() == village[:1].lower() else 10
+            )
+        scored.append((distance, cand_district, cand_sub, cand_village))
+    scored.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+    best = scored[0]
+    return best[1], best[2], best[3]
+
+
+def resolve_series_location(
+    district: str,
+    subdistrict: str | None,
+    village: str | None,
+) -> tuple[str, str, str, dict[str, Any] | None]:
+    """Return the location to read, with a sticky nearest-village fallback when empty.
+
+    Once a fallback source is chosen it is persisted so refresh keeps the same series
+    until the requested village has its own stored rows.
+    """
+    district_name, subdistrict_name, village_name = normalize_location(district, subdistrict, village)
+    if not village_name:
+        return district_name, subdistrict_name, village_name, None
+    if location_has_rows(district_name, subdistrict_name, village_name):
+        _clear_sticky_fallback(district_name, subdistrict_name, village_name)
+        return district_name, subdistrict_name, village_name, None
+
+    sticky = _read_sticky_fallback(district_name, subdistrict_name, village_name)
+    if sticky and location_has_rows(sticky[0], sticky[1], sticky[2]):
+        source = sticky
+    else:
+        source = _nearest_stored_village(district_name, subdistrict_name, village_name)
+        if source is None:
+            return district_name, subdistrict_name, village_name, None
+        _write_sticky_fallback(district_name, subdistrict_name, village_name, source)
+
+    meta = {
+        "requested": {
+            "district": district_name,
+            "subdistrict": subdistrict_name,
+            "village": village_name,
+        },
+        "source": {
+            "district": source[0],
+            "subdistrict": source[1],
+            "village": source[2],
+        },
+        "sticky": True,
+        "note": (
+            f"No indices stored yet for {village_name}; "
+            f"showing nearest stored village {source[2]} until this village is stored."
+        ),
+    }
+    return source[0], source[1], source[2], meta
 
 
 def aggregated_series(

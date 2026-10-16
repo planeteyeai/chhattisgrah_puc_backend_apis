@@ -122,6 +122,7 @@ const state = {
   charts: [],
   indexPlaces: [],
   indexSeries: [],
+  indexFallback: null,
   indexDone: -1,
   indexCronDone: -1,
   indexFingerprint: null,
@@ -1107,9 +1108,16 @@ function drawIndexTrend() {
   const series = state.indexSeries;
   const board = $("index-board");
   if ($("index-range")) {
-    $("index-range").textContent = series.length
-      ? `${indexScopeLabel()} · ${$("index-frequency").value} · ${series[0].period} to ${series[series.length - 1].period}`
-      : `${indexScopeLabel()} · no stored scenes yet`;
+    const fallback = state.indexFallback;
+    if (fallback?.source?.village) {
+      $("index-range").textContent = series.length
+        ? `${indexScopeLabel()} · showing nearest stored ${indexPlaceLabel(fallback.source.village)} until this village is stored · ${$("index-frequency").value} · ${series[0].period} to ${series[series.length - 1].period}`
+        : `${indexScopeLabel()} · no stored scenes yet`;
+    } else {
+      $("index-range").textContent = series.length
+        ? `${indexScopeLabel()} · ${$("index-frequency").value} · ${series[0].period} to ${series[series.length - 1].period}`
+        : `${indexScopeLabel()} · no stored scenes yet`;
+    }
   }
   state.indexCharts.forEach((chart) => chart.destroy());
   state.indexCharts = [];
@@ -1150,10 +1158,12 @@ async function loadIndexTrend() {
   if (!$("index-district").value) return;
   const payload = await readFresh(`/indices/retrieve-aggregated?${indexQuery().toString()}`);
   const series = payload.series || [];
-  const fingerprint = series.map((row) => `${row.period}:${row.ndvi}:${row.evi}:${row.ndmi}`).join("|");
+  const fallbackKey = payload.fallback?.source?.village || "";
+  const fingerprint = `${fallbackKey}|` + series.map((row) => `${row.period}:${row.ndvi}:${row.evi}:${row.ndmi}`).join("|");
   if (fingerprint === state.indexFingerprint) return;
   state.indexFingerprint = fingerprint;
   state.indexSeries = series;
+  state.indexFallback = payload.fallback || null;
   drawIndexTrend();
 }
 
@@ -1243,8 +1253,11 @@ async function startIndexStore() {
   const button = $("index-store");
   button.disabled = true;
   try {
-    const body = await readFresh("/indices/store-all?years=10&step_days=16&sync=false", { method: "POST" });
-    showBanner(`Storing indices for ${body.locations} villages, subdistricts, and districts.`);
+    const body = await readFresh(
+      "/indices/store-all?years=10&step_days=16&sync=false&pending_only=true",
+      { method: "POST" },
+    );
+    showBanner(`Storing indices for ${body.locations} pending villages.`);
     await refreshIndexStatus();
   } catch (error) {
     showBanner(error.message);
